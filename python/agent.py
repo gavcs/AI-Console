@@ -97,6 +97,7 @@ import sys
 import threading
 import time
 import uuid
+from urllib.parse import urlparse
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
@@ -526,8 +527,16 @@ class AsyncAgent:
         self.cfg = cfg
         self.registry = registry
         self.emit = emit
+        # A local model server is never reached through a proxy: a proxy in the
+        # environment (HTTP_PROXY / ALL_PROXY, common on CI and corporate
+        # machines) would otherwise swallow the 127.0.0.1 request and the
+        # connection would hang. A genuinely remote server still honours the
+        # environment's proxy settings.
+        host = (urlparse(cfg.base_url).hostname or "").lower()
+        local = host in ("localhost", "::1") or host.startswith("127.")
         self.http = httpx.AsyncClient(
             timeout=httpx.Timeout(15.0, read=None),
+            trust_env=not local,
             headers={"Authorization": f"Bearer {cfg.api_key}"} if cfg.api_key else None)
         self._split: ThinkSplitter | None = None    # the reply being streamed right now
         self.messages: list[dict[str, Any]] = []

@@ -21,6 +21,9 @@ Config file (JSON), written by the Qt app:
                                                continued from there; see history.py)
     "label": "Qwen3.5-9B-MLX-4bit",          (optional: the name saved with each answer)
     "api_key": "...",                        (optional: sent as a Bearer token to the model server)
+    "effort": "medium",                      (optional: how much the model should think; see "Effort")
+    "wait_for_server": true,                 (optional: the model server was just started; the first
+                                               message waits until it answers)
     "mcp_servers": [
       {"name": "ghidra", "transport": "stdio", "command": "python3",
        "args": ["ghidra_bridge.py", "--bridge-dir", "/path/to/ghidra-mcp",
@@ -36,6 +39,9 @@ Only needs `httpx` and `mcp` (httpx is a dependency of mcp).
 Chat protocol (chat mode):
   stdin  -> {"type":"user","content":"...","attachments":[ ... ]} | {"type":"reset"}
             {"type":"stop"}   stop the reply being written (what was written so far is kept)
+            {"type":"configure","model":...,"label":...,"effort":...,"wait_for_server":bool}
+                              change who answers and how hard it thinks from the next message on
+                              (every key optional); answered with "configured"
             "attachments" is optional; each entry is a file the user attached:
               {"kind":"image",  "name","mime","path","data_url":"data:...;base64,..."}
               {"kind":"text",   "name","mime","path","text":"<contents>","truncated":bool}
@@ -53,6 +59,9 @@ Chat protocol (chat mode):
             {"type":"tool_result","id":...,"name":...,"content":"..."}
             {"type":"error","message":"..."}
             {"type":"stopped"}                         the reply was stopped on request ("done" follows)
+            {"type":"configured","model":...,"label":...,"effort":...,"tools":[...]}
+                                                       the answer to "configure": what is in use now
+            {"type":"status","message":"..."}          what a turn is waiting for (shown, not kept)
             {"type":"done","content":"<full answer>"}  end of turn
   stderr <- human-readable log lines
 
@@ -65,6 +74,16 @@ Thinking: reasoning reaches us in one of three shapes, all turned into
      The first such reply is streamed as answer text and then corrected with
      "answer_was_thinking"; that the model behaves this way is remembered
      (model_traits.json next to the config), so later replies start as thinking.
+
+Effort: "off", "low", "medium" or "high" (anything higher counts as "high";
+empty = say nothing and leave it to the server). There is no one way to ask an
+OpenAI-compatible server for this, so the request carries the fields the common
+servers read, and each server uses the ones it knows:
+  reasoning_effort                      OpenAI's own field ("none" for off)
+  chat_template_kwargs.enable_thinking  switches a thinking model's reasoning on or off
+  thinking_token_budget                 a cap on reasoning tokens, for low and medium
+A server that refuses a request because of them is asked again without, and
+the level is then left out for the rest of the session.
 """
 from __future__ import annotations
 
@@ -76,6 +95,7 @@ import os
 import re
 import sys
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
@@ -93,6 +113,8 @@ Emit = Callable[[Event], Awaitable[None]]
 
 MAX_TOOL_ROUNDS = 25          # tool-call rounds per user turn before giving up
 MAX_TOOL_RESULT_CHARS = 30000 # cap what goes back into the model's context per tool result
+SERVER_WAIT_SECONDS = 900     # how long a message waits for a model server that is still starting
+THINKING_BUDGETS = {"low": 512, "medium": 2048}   # reasoning tokens (see "Effort"); "high" has no cap
 
 
 # --------------------------------------------------------------------------- config
@@ -125,6 +147,9 @@ class Config:
     history: str = ""                           # file the conversation is saved in ("" = not saved)
     api_key: str = ""                           # for a model server that wants one
     label: str = ""                             # who answers, as saved with each reply
+    effort: str = ""                            # see "Effort" in the module docstring
+    effort_refused: bool = False                # the server would not take the effort fields
+    wait_for_server: bool = False               # the next message waits for the server to answer
 
     @classmethod
     def load(cls, path: str | None = None) -> "Config":
@@ -144,6 +169,8 @@ class Config:
             history=raw.get("history", ""),
             api_key=raw.get("api_key", ""),
             label=raw.get("label", ""),
+            effort=raw.get("effort", ""),
+            wait_for_server=bool(raw.get("wait_for_server", False)),
         )
 
     # What we have learned about a model by watching its output (see "Thinking").
@@ -377,6 +404,38 @@ class ThinkSplitter:
             self.thinking = self.assumed = False
 
 
+def effort_fields(effort: str) -> dict[str, Any]:
+    """The request fields that ask a model server for this level of thinking (see "Effort")."""
+    if effort == "off":
+        return {"reasoning_effort": "none", "chat_template_kwargs": {"enable_thinking": False}}
+    if effort in ("xhigh", "max"):
+        effort = "high"
+    if effort not in ("low", "medium", "high"):
+        return {}
+    fields: dict[str, Any] = {"reasoning_effort": effort, "chat_template_kwargs": {"enable_thinking": True}}
+    if effort in THINKING_BUDGETS:
+        fields["thinking_token_budget"] = THINKING_BUDGETS[effort]
+    return fields
+
+
+async def wait_for_server(client: httpx.AsyncClient, cfg: Config, emit: Emit,
+                          timeout: float = SERVER_WAIT_SECONDS) -> bool:
+    """Hold on until the model server answers (it was just started and may be loading a model)."""
+    started = time.monotonic()
+    while True:
+        try:
+            resp = await client.get(f"{cfg.base_url}/models", timeout=5.0)
+            if resp.status_code < 500:
+                return True
+        except httpx.HTTPError:
+            pass
+        waited = time.monotonic() - started
+        if waited > timeout:
+            return False
+        await emit({"type": "status", "message": f"waiting for the model server… {int(waited)} s"})
+        await asyncio.sleep(1.5)
+
+
 async def stream_completion(client: httpx.AsyncClient, cfg: Config, messages: list[dict[str, Any]],
                             tools: list[dict[str, Any]], emit: Emit, start_thinking: bool = False,
                             split: "ThinkSplitter | None" = None):
@@ -391,6 +450,8 @@ async def stream_completion(client: httpx.AsyncClient, cfg: Config, messages: li
     if tools:
         body["tools"] = tools
         body["tool_choice"] = "auto"
+    extra = {} if cfg.effort_refused else effort_fields(cfg.effort)
+    body.update(extra)
 
     split = split or ThinkSplitter(start_thinking)
     calls: dict[int, dict[str, str]] = {}      # index -> {id, name, arguments}
@@ -405,40 +466,51 @@ async def stream_completion(client: httpx.AsyncClient, cfg: Config, messages: li
             else:
                 await emit({"type": kind})
 
-    async with client.stream("POST", f"{cfg.base_url}/chat/completions", json=body) as resp:
-        if resp.status_code != 200:
-            detail = (await resp.aread()).decode("utf-8", errors="replace")
-            raise RuntimeError(f"HTTP {resp.status_code} from model server: {detail[:500]}")
-        async for line in resp.aiter_lines():
-            if not line.startswith("data:"):
-                continue
-            data = line[5:].strip()
-            if data == "[DONE]":
-                break
-            chunk = json.loads(data)
-            choices = chunk.get("choices") or []
-            if not choices:
-                continue
-            choice = choices[0]
-            delta = choice.get("delta") or {}
-            reasoning = delta.get("reasoning_content") or delta.get("reasoning")
-            if reasoning:
-                split.server_separates()
-                split.thinking_text += reasoning
-                await emit({"type": "thinking", "content": reasoning})
-            if delta.get("content"):
-                await emit_parts(split.feed(delta["content"]))
-            for tc in delta.get("tool_calls") or []:
-                slot = calls.setdefault(tc.get("index", 0), {"id": "", "name": "", "arguments": ""})
-                if tc.get("id"):
-                    slot["id"] = tc["id"]
-                fn = tc.get("function") or {}
-                if fn.get("name") and not slot["name"]:
-                    slot["name"] = fn["name"]
-                if fn.get("arguments"):
-                    slot["arguments"] += fn["arguments"]
-            if choice.get("finish_reason"):
-                finish = choice["finish_reason"]
+    while True:
+        async with client.stream("POST", f"{cfg.base_url}/chat/completions", json=body) as resp:
+            if resp.status_code != 200:
+                detail = (await resp.aread()).decode("utf-8", errors="replace")
+                if extra and resp.status_code in (400, 422):
+                    # Most likely the effort fields (see "Effort"): ask again without them.
+                    print(f"[effort] the model server refused the request (HTTP {resp.status_code}); "
+                          f"asking again without an effort level: {detail[:200]}", file=sys.stderr, flush=True)
+                    for key in extra:
+                        body.pop(key, None)
+                    extra = {}
+                    cfg.effort_refused = True
+                    continue
+                raise RuntimeError(f"HTTP {resp.status_code} from model server: {detail[:500]}")
+            async for line in resp.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                chunk = json.loads(data)
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                choice = choices[0]
+                delta = choice.get("delta") or {}
+                reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+                if reasoning:
+                    split.server_separates()
+                    split.thinking_text += reasoning
+                    await emit({"type": "thinking", "content": reasoning})
+                if delta.get("content"):
+                    await emit_parts(split.feed(delta["content"]))
+                for tc in delta.get("tool_calls") or []:
+                    slot = calls.setdefault(tc.get("index", 0), {"id": "", "name": "", "arguments": ""})
+                    if tc.get("id"):
+                        slot["id"] = tc["id"]
+                    fn = tc.get("function") or {}
+                    if fn.get("name") and not slot["name"]:
+                        slot["name"] = fn["name"]
+                    if fn.get("arguments"):
+                        slot["arguments"] += fn["arguments"]
+                if choice.get("finish_reason"):
+                    finish = choice["finish_reason"]
+        break
 
     await emit_parts(split.flush())
     ordered = [calls[i] for i in sorted(calls)]
@@ -480,6 +552,28 @@ class AsyncAgent:
         self.messages.append(msg)
         self.history.append(msg)
 
+    def configure(self, msg: dict[str, Any]) -> Event:
+        """Change the model, its label or the effort for the messages that follow.
+
+        The conversation is untouched: the next request simply names another
+        model (and carries the whole conversation, as every request does).
+        """
+        model = msg.get("model")
+        if isinstance(model, str) and model and model != self.cfg.model:
+            self.cfg.model = model
+            self.label = model.rsplit("/", 1)[-1]
+            # What was learned about how a model marks its reasoning is per model.
+            self.think_in_prompt = bool(self.cfg.trait("think_in_prompt", False))
+        if isinstance(msg.get("label"), str) and msg["label"]:
+            self.label = msg["label"]
+        if isinstance(msg.get("effort"), str):
+            self.cfg.effort = msg["effort"]
+        self.cfg.effort_refused = False             # another model or level may be accepted
+        if msg.get("wait_for_server"):
+            self.cfg.wait_for_server = True
+        return {"type": "configured", "model": self.cfg.model, "label": self.label,
+                "effort": self.cfg.effort, "tools": self.registry.names}
+
     def stopped(self) -> None:
         """The user stopped the turn: keep what was written and leave the conversation valid."""
         split, self._split = self._split, None
@@ -500,9 +594,16 @@ class AsyncAgent:
 
     async def ask(self, text: str, attachments: list[dict[str, Any]] | None = None) -> str:
         self._add(saved.user_message(text, attachments))
+        if self.cfg.wait_for_server:
+            # The model server was (re)started for this model and may still be
+            # loading it. Stopping the turn ends the wait like any other reply.
+            self.cfg.wait_for_server = False
+            if not await wait_for_server(self.http, self.cfg, self.emit):
+                print("[server] the model server still does not answer; trying anyway", file=sys.stderr, flush=True)
         final = ""
         for _ in range(MAX_TOOL_ROUNDS):
-            self._split = ThinkSplitter(self.think_in_prompt)
+            # With thinking switched off there is no unmarked reasoning to expect.
+            self._split = ThinkSplitter(self.think_in_prompt and self.cfg.effort != "off")
             split, calls, _finish = await stream_completion(
                 self.http, self.cfg, self.messages, self.registry.specs, self.emit, split=self._split)
             self._split = None
@@ -700,6 +801,8 @@ async def _chat_main(cfg: Config) -> None:
                     turn.cancel()
             elif busy:
                 await emit({"type": "error", "message": "still answering the previous message"})
+            elif msg.get("type") == "configure":
+                await emit(agent.configure(msg))
             elif msg.get("type") == "reset":
                 agent.reset()
             elif msg.get("type") == "user":

@@ -27,6 +27,7 @@ private:
     QLabel         *m_note     = nullptr;
     QLineEdit      *m_baseUrl  = nullptr;
     QLineEdit      *m_start    = nullptr;
+    QLineEdit      *m_stop     = nullptr;
     QPlainTextEdit *m_models   = nullptr;
     QLineEdit      *m_apiKey   = nullptr;
     QLineEdit      *m_python   = nullptr;

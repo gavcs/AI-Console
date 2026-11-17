@@ -31,12 +31,14 @@ struct Provider {
     QString startCommand;   // what "Start server" runs; {model}, {port} and {host} are filled in. Empty = never started from here
     QString model;          // a model id in the form this server expects (may be empty)
     QString note;           // one line shown under the dropdown
+    QString stopCommand;    // run when the app closes, for a server that outlives its start command (usually empty)
 };
 
 struct AppSettings {
     QString     provider;       // Provider::id the fields below were last filled in from
     QString     baseUrl;
     QString     startCommand;
+    QString     stopCommand;    // run when the app closes, if "Start server" was used (empty = stopping the start command is enough)
     QStringList models;         // offered in the Model box on the start page (anything else can be typed)
     QString     apiKey;         // sent as a Bearer token, for a server that wants one (empty = none)
     QString     python;         // interpreter that runs python/*.py and scripts ("python3" = first on the PATH)
@@ -64,7 +66,8 @@ inline const QList<Provider> &providers() {
         {"lmstudio", "LM Studio", "http://127.0.0.1:1234/v1",
          "lms server start --port {port}",
          "",
-         "Load a model in LM Studio. The Model box on the start page lists what the running server offers."},
+         "Load a model in LM Studio. The Model box on the start page lists what the running server offers.",
+         "lms server stop"},
         {"llama.cpp", "llama.cpp (llama-server)", "http://127.0.0.1:8080/v1",
          "llama-server -hf {model} --jinja --port {port}",
          "ggml-org/gemma-3-4b-it-GGUF",
@@ -91,6 +94,7 @@ inline AppSettings defaults() {
     s.provider     = p.id;
     s.baseUrl      = p.baseUrl;
     s.startCommand = p.startCommand;
+    s.stopCommand  = p.stopCommand;
     s.models       = QStringList{p.model};
     s.python       = QStringLiteral("python3");
     return s;
@@ -115,6 +119,7 @@ inline AppSettings load() {
     text("provider", &s.provider);
     text("baseUrl", &s.baseUrl);
     text("startCommand", &s.startCommand);
+    text("stopCommand", &s.stopCommand);
     text("apiKey", &s.apiKey);
     text("python", &s.python);
     text("claude", &s.claude);
@@ -142,6 +147,7 @@ inline bool save(const AppSettings &s, QString *error = nullptr) {
     const QJsonObject o{{"provider", s.provider},
                         {"baseUrl", s.baseUrl},
                         {"startCommand", s.startCommand},
+                        {"stopCommand", s.stopCommand},
                         {"models", QJsonArray::fromStringList(s.models)},
                         {"apiKey", s.apiKey},
                         {"python", s.python},

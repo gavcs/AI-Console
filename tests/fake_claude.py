@@ -11,8 +11,8 @@ What a turn does depends on words in the user's message:
   "hidden"   reasons without sending any reasoning text, then answers
   "slow"     writes one word every 0.1 s for 10 s, and can be interrupted
 
-$FAKE_CLAUDE_OLD=1 makes it refuse --thinking-display, like a Claude Code
-version that does not have the option.
+$FAKE_CLAUDE_OLD=1 makes it refuse --thinking-display and --effort and answer
+"set_model" with an error, like a Claude Code version that has none of them.
 
 Use it by pointing the app at it: AI_CONSOLE_CLAUDE=/path/to/fake_claude.py
 """
@@ -23,9 +23,11 @@ import sys
 import threading
 import time
 
-if os.environ.get("FAKE_CLAUDE_OLD") and "--thinking-display" in sys.argv:
-    sys.stderr.write("error: unknown option '--thinking-display'\n")
-    sys.exit(1)
+OLD = bool(os.environ.get("FAKE_CLAUDE_OLD"))
+for option in ("--thinking-display", "--effort"):
+    if OLD and option in sys.argv:
+        sys.stderr.write(f"error: unknown option '{option}'\n")
+        sys.exit(1)
 
 capture = {"argv": sys.argv[1:], "cwd": os.getcwd(), "stdin": []}
 
@@ -73,6 +75,10 @@ threading.Thread(target=read_stdin, daemon=True).start()
 def control(msg):
     """Answer a control request. True if it was an interrupt."""
     servers = [{"name": "demo", "status": "connected", "tools": [{"name": "lookup"}]}]
+    if OLD and msg["request"]["subtype"] == "set_model":
+        out({"type": "control_response",
+             "response": {"subtype": "error", "request_id": msg["request_id"], "error": "unsupported request"}})
+        return False
     out({"type": "control_response",
          "response": {"subtype": "success", "request_id": msg["request_id"],
                       "response": {"mcpServers": servers}}})

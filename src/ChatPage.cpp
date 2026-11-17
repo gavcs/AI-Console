@@ -2,6 +2,7 @@
 
 #include <QAbstractTextDocumentLayout>
 #include <QBuffer>
+#include <QComboBox>
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -18,7 +19,9 @@
 #include <QScrollArea>
 #include <QScrollBar>
 #include <QShortcut>
+#include <QSignalBlocker>
 #include <QSplitter>
+#include <QStandardItemModel>
 #include <QStringConverter>
 #include <QTextBrowser>
 #include <QTextDocument>
@@ -27,6 +30,9 @@
 #include <QWheelEvent>
 #include <cmath>
 #include <functional>
+
+#include "EffortScale.h"
+#include "ProcessUtil.h"
 
 namespace {
 QString compactJson(const QJsonValue &v, int maxChars) {
@@ -391,11 +397,45 @@ ChatPage::ChatPage(QWidget *parent) : QWidget(parent) {
     inputRow->addWidget(m_input, 1);
     inputRow->addWidget(m_send, 0, Qt::AlignBottom);
 
+    // Who answers and how hard it thinks, for the messages that follow.
+    m_modelBox = new QComboBox;
+    m_modelBox->setObjectName("chatModel");
+    m_modelBox->setToolTip("Who answers from the next message on. The conversation stays as it is: "
+                           "the model you switch to gets all of it.");
+    // activated, not currentIndexChanged: only a choice made by hand asks for a change.
+    connect(m_modelBox, &QComboBox::activated, this, [this](int index) {
+        const QStringList choice = m_modelBox->itemData(index).toStringList();
+        if (choice.size() != 2)
+            return;
+        LaunchConfig c = m_config;
+        if (choice[0] == "claude") {
+            c.backend     = LaunchConfig::Backend::ClaudeCode;
+            c.claudeModel = choice[1];
+        } else {
+            c.backend = LaunchConfig::Backend::LocalModel;
+            c.model   = choice[1];
+        }
+        requestSettings(c);
+    });
+    m_effort = new EffortScale;
+    m_effort->setObjectName("chatEffort");
+    connect(m_effort, &EffortScale::levelChanged, this, [this](const QString &level) {
+        LaunchConfig c = m_config;
+        c.effort = level;
+        requestSettings(c);
+    });
+    auto *optionsRow = new QHBoxLayout;
+    optionsRow->setSpacing(18);
+    optionsRow->addWidget(m_modelBox);
+    optionsRow->addWidget(m_effort);
+    optionsRow->addStretch(1);
+
     auto *layout = new QVBoxLayout(this);
     layout->addLayout(headerRow);
     layout->addWidget(split, 1);
     layout->addWidget(m_attachStrip);
     layout->addLayout(inputRow);
+    layout->addLayout(optionsRow);
 
     // Re-rendering Markdown on every token would be wasteful; do it at most
     // every 60 ms while text is streaming in.
@@ -404,6 +444,7 @@ ChatPage::ChatPage(QWidget *parent) : QWidget(parent) {
     connect(&m_renderTimer, &QTimer::timeout, this, &ChatPage::render);
 
     m_agent.setProcessChannelMode(QProcess::SeparateChannels);
+    proc::ownGroup(m_agent);   // so that stopAgent() reaches the MCP servers the agent runs
     connect(&m_agent, &QProcess::readyReadStandardOutput, this, &ChatPage::onStdout);
     connect(&m_agent, &QProcess::readyReadStandardError,  this, &ChatPage::onStderr);
     connect(&m_agent, &QProcess::finished, this, [this](int code, QProcess::ExitStatus st) {
@@ -416,7 +457,9 @@ ChatPage::ChatPage(QWidget *parent) : QWidget(parent) {
                                "or use Continue on the start page]"));
         const bool wasAnswering = m_turnActive;
         m_turnActive = false;
+        m_configuring = false;
         setBusy(true);
+        syncControls();
         if (wasAnswering)
             emit turnFinished();
     });
@@ -438,6 +481,8 @@ void ChatPage::begin(const LaunchConfig &config, const Command &agentCommand, co
     stopAgent();
     m_config = config;
     m_turnActive = false;
+    m_configuring = false;
+    syncControls();
     m_header->setText(QStringLiteral("<b>Chat</b> — %1").arg(config.summary().toHtmlEscaped()));
     m_readyStatus.clear();
     m_status->setText("starting agent…");
@@ -459,7 +504,7 @@ void ChatPage::begin(const LaunchConfig &config, const Command &agentCommand, co
 
 void ChatPage::submit() {
     const QString text = m_input->toPlainText().trimmed();
-    if ((text.isEmpty() && m_pendingAttachments.isEmpty()) || !m_ready || m_turnActive)
+    if ((text.isEmpty() && m_pendingAttachments.isEmpty()) || !m_ready || m_turnActive || m_configuring)
         return;
     m_input->clear();
     m_stickToBottom = true;
@@ -496,7 +541,89 @@ void ChatPage::stopTurn() {
 void ChatPage::updateSendButton() {
     m_send->setText(m_turnActive ? "Stop" : "Send");
     m_send->setToolTip(m_turnActive ? "Stop this reply (Esc)" : "Send (Enter)");
-    m_send->setEnabled(m_turnActive ? isAgentRunning() : m_ready);
+    m_send->setEnabled(m_turnActive ? isAgentRunning() : m_ready && !m_configuring);
+}
+
+// ---- model and effort ------------------------------------------------------------
+
+void ChatPage::setLocalModels(const QStringList &models) {
+    m_localModels = models;
+    syncControls();
+}
+
+// Fill the model picker and set both controls to what is in use (or, while a
+// change is being applied, to what was asked for).
+void ChatPage::syncControls() {
+    const LaunchConfig &shown = m_configuring ? m_pendingConfig : m_config;
+    const bool claudeNow = shown.backend == LaunchConfig::Backend::ClaudeCode;
+    const QSignalBlocker block(m_modelBox);
+    m_modelBox->clear();
+
+    QStringList local = m_localModels;
+    local.removeAll(QString());
+    if (!shown.model.isEmpty() && !local.contains(shown.model))
+        local.prepend(shown.model);
+    for (const QString &id : local) {
+        m_modelBox->addItem(id.section('/', -1), QStringList{"local", id});
+        m_modelBox->setItemData(m_modelBox->count() - 1, id, Qt::ToolTipRole);
+    }
+    if (!local.isEmpty())
+        m_modelBox->insertSeparator(m_modelBox->count());
+
+    const int firstClaude = m_modelBox->count();
+    m_modelBox->addItem("Claude Code · its default model", QStringList{"claude", QString()});
+    for (const ClaudeModel &m : claude::models())
+        m_modelBox->addItem(QStringLiteral("Claude %1").arg(QLatin1String(m.name)),
+                            QStringList{"claude", QString::fromLatin1(m.id)});
+    if (claudeNow && !shown.claudeModel.isEmpty() && claude::name(shown.claudeModel).isEmpty())
+        m_modelBox->addItem(shown.shortModel(), QStringList{"claude", shown.claudeModel});
+    // Without the claude CLI its models can be seen but not chosen.
+    if (commands::findClaude().isEmpty() && !claudeNow)
+        if (auto *items = qobject_cast<QStandardItemModel *>(m_modelBox->model()))
+            for (int i = firstClaude; i < m_modelBox->count(); ++i) {
+                items->item(i)->setEnabled(false);
+                items->item(i)->setToolTip("The claude command was not found: install Claude Code, or choose it in Settings.");
+            }
+
+    const QStringList current{claudeNow ? "claude" : "local", claudeNow ? shown.claudeModel : shown.model};
+    m_modelBox->setCurrentIndex(m_modelBox->findData(current));
+
+    m_effort->setBackend(shown.backend);
+    m_effort->setLevel(shown.effort);
+}
+
+void ChatPage::requestSettings(LaunchConfig config) {
+    config.effort = effort::clamp(config.effort, config.backend);   // "off" means nothing to Claude, "max" nothing locally
+    const bool same = config.backend == m_config.backend && config.model == m_config.model &&
+                      config.claudeModel == m_config.claudeModel && config.effort == m_config.effort;
+    if (same || !m_ready || m_turnActive || m_configuring) {
+        syncControls();
+        return;
+    }
+    emit settingsChangeRequested(config);
+    // Until the change is confirmed ("configured", or a restart through begin()), show what is in effect.
+    if (!m_configuring)
+        syncControls();
+}
+
+void ChatPage::applySettings(const LaunchConfig &config, bool waitForServer) {
+    if (!m_ready || m_turnActive || m_configuring || config.backend != m_config.backend) {
+        syncControls();
+        return;
+    }
+    const bool claude = config.backend == LaunchConfig::Backend::ClaudeCode;
+    m_pendingConfig = config;
+    m_pendingWait   = waitForServer;
+    m_configuring   = true;
+    m_status->setText("switching…");
+    setBusy(true);
+    QJsonObject msg{{"type", "configure"},
+                    {"model", claude ? config.claudeModel : config.model},
+                    {"label", config.shortModel()},
+                    {"effort", config.effort}};
+    if (waitForServer)
+        msg["wait_for_server"] = true;
+    m_agent.write(QJsonDocument(msg).toJson(QJsonDocument::Compact) + '\n');
 }
 
 void ChatPage::onStdout() {
@@ -531,6 +658,32 @@ void ChatPage::handleEvent(const QJsonObject &ev) {
         addNote(m_replayed ? QStringLiteral("Continuing with: %1").arg(m_config.summary())
                            : QStringLiteral("Session started: %1").arg(m_config.summary()));
         setBusy(false);
+    } else if (type == "configured") {
+        // The answer to applySettings(): the agent now uses what was asked for.
+        if (!m_configuring)
+            return;
+        QStringList changed;
+        if (m_pendingConfig.shortModel() != m_config.shortModel())
+            changed << QStringLiteral("now answering: %1").arg(m_pendingConfig.shortModel());
+        if (m_pendingConfig.effort != m_config.effort)
+            changed << QStringLiteral("effort: %1").arg(effort::label(m_pendingConfig.effort).toLower());
+        m_config = m_pendingConfig;
+        m_configuring = false;
+        m_header->setText(QStringLiteral("<b>Chat</b> — %1").arg(m_config.summary().toHtmlEscaped()));
+        const int n = ev["tools"].toArray().size();
+        m_readyStatus = n ? QStringLiteral("ready · %1 tools").arg(n) : QStringLiteral("ready · no tools");
+        m_status->setText(m_readyStatus);
+        if (!changed.isEmpty())
+            addNote(QStringLiteral("Changed — %1").arg(changed.join(" · ")));
+        if (m_pendingWait)
+            addNote(QStringLiteral("The model server is restarting with this model. Your next message waits until it "
+                                   "is ready (its log is behind “Server log” on the start page)."));
+        syncControls();
+        setBusy(false);
+        emit settingsChanged(m_config);
+    } else if (type == "status") {
+        if (m_turnActive)
+            m_status->setText(ev["message"].toString());
     } else if (type == "delta") {
         appendAnswer(ev["content"].toString());
     } else if (type == "thinking") {
@@ -587,6 +740,8 @@ void ChatPage::handleEvent(const QJsonObject &ev) {
 void ChatPage::setBusy(bool busy) {
     m_input->setEnabled(!busy && m_ready);
     m_attach->setEnabled(!busy && m_ready);
+    m_modelBox->setEnabled(!busy && m_ready);     // a change applies between messages, not during a reply
+    m_effort->setEnabled(!busy && m_ready);
     updateSendButton();
     if (!busy && m_ready)
         m_input->setFocus();
@@ -682,11 +837,11 @@ void ChatPage::stopAgent() {
     m_ready = false;
     if (m_agent.state() == QProcess::NotRunning)
         return;
-    m_agent.closeWriteChannel();            // EOF on stdin: agent.py exits cleanly
-    if (!m_agent.waitForFinished(2000)) {
-        m_agent.kill();
-        m_agent.waitForFinished(1000);
-    }
+    const qint64 pid = m_agent.processId();
+    m_agent.closeWriteChannel();            // EOF on stdin: the agent closes its MCP servers and exits
+    if (!m_agent.waitForFinished(4000))
+        proc::stop(m_agent, 500);
+    proc::sweepGroup(pid);                  // an MCP server that outlived the agent
 }
 
 void ChatPage::log(const QString &text) {

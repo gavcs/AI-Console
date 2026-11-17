@@ -17,6 +17,7 @@ class QPushButton;
 class QRadioButton;
 class QVBoxLayout;
 class QWidget;
+class EffortScale;
 
 // First screen: model, MCP tools (and which location of each to use), and how
 // to prompt. Polls the model server and, for each tool, the health URL of the
@@ -35,6 +36,9 @@ public:
     void setOpenConversation(bool open, const QString &title = QString());
     // The app's settings were edited: show the new model list and server address.
     void settingsChanged();
+    // The local models on offer: the ones in the settings, what the running
+    // server reports, and whatever was typed.
+    QStringList localModels() const;
 
 signals:
     void startRequested(const LaunchConfig &config);
@@ -82,8 +86,11 @@ private:
     // who answers: the local model server or Claude Code
     QRadioButton *m_localBackend  = nullptr;
     QRadioButton *m_claudeBackend = nullptr;
-    QComboBox    *m_claudeModel   = nullptr;   // empty text = Claude Code's default model
+    QComboBox    *m_claudeModel   = nullptr;   // itemData: the model id; other text = typed as is
     QLabel       *m_claudeStatus  = nullptr;
+    EffortScale  *m_effort        = nullptr;   // how hard the model thinks (levels follow the backend)
+    QString claudeModelId() const;
+    void    showClaudeModel(const QString &id);
 
     // model + server
     QComboBox   *m_model        = nullptr;

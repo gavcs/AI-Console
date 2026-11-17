@@ -27,6 +27,7 @@
 #include <algorithm>
 
 #include "Commands.h"
+#include "EffortScale.h"
 #include "McpServers.h"
 #include "ServerDialog.h"
 
@@ -79,24 +80,39 @@ LaunchPage::LaunchPage(QWidget *parent)
     backendRow->addWidget(m_claudeBackend);
     backendRow->addStretch(1);
 
+    // The current models by name and number; any other model name or alias can be typed.
     m_claudeModel = new QComboBox;
-    m_claudeModel->setEditable(true);              // an alias or a full model name
-    m_claudeModel->addItems({QString(), "fable", "opus", "sonnet", "haiku"});
+    m_claudeModel->setEditable(true);
+    m_claudeModel->setInsertPolicy(QComboBox::NoInsert);
+    m_claudeModel->addItem(QString(), QString());  // empty = Claude Code's own default
+    for (const ClaudeModel &m : claude::models())
+        m_claudeModel->addItem(QString::fromLatin1(m.name), QString::fromLatin1(m.id));
     m_claudeModel->lineEdit()->setPlaceholderText("Claude Code's default");
-    m_claudeModel->setCurrentText(settings.value("claudeModel").toString());
+    m_claudeModel->setToolTip("Which Claude answers. Pick one by name, type any other model name or alias, "
+                              "or leave it empty for Claude Code's own default.");
+    showClaudeModel(settings.value("claudeModel").toString());
     m_claudeModel->setMinimumWidth(220);           // room for the placeholder text
     m_claudeStatus = new QLabel;
     auto *claudeRow = new QHBoxLayout;
     claudeRow->addWidget(m_claudeModel);
     claudeRow->addWidget(m_claudeStatus, 1);
 
+    m_effort = new EffortScale(false);
+    auto *effortRow = new QHBoxLayout;
+    effortRow->addWidget(m_effort);
+    effortRow->addStretch(1);
+
     auto *form = new QFormLayout;
     form->addRow("Run with:", backendRow);
     form->addRow("Model:",  m_model);
     form->addRow("Server:", serverRow);
     form->addRow("Claude model:", claudeRow);
+    form->addRow("Effort:", effortRow);
     connect(m_claudeBackend, &QRadioButton::toggled, this, &LaunchPage::updateBackendWidgets);
     updateBackendWidgets();
+    m_effort->setLevel(effort::clamp(settings.value("effort").toString(),
+                                     m_claudeBackend->isChecked() ? LaunchConfig::Backend::ClaudeCode
+                                                                  : LaunchConfig::Backend::LocalModel));
 
     // ---- tools ------------------------------------------------------------
     // Rows come from the user's mcp_servers.json; nothing is built in.
@@ -217,6 +233,31 @@ LaunchPage::LaunchPage(QWidget *parent)
     connect(&m_probeTimer, &QTimer::timeout, this, &LaunchPage::probeAll);
     setServerStatus(false, {});
     checkSetup();
+}
+
+// What the Claude model box says, as the id the claude CLI takes: a listed
+// name ("Opus 5.5") or bare alias ("opus") is its numbered model.
+QString LaunchPage::claudeModelId() const {
+    return claude::idFor(m_claudeModel->currentText());
+}
+
+void LaunchPage::showClaudeModel(const QString &id) {
+    const int listed = id.isEmpty() ? 0 : m_claudeModel->findData(claude::idFor(id));
+    if (listed >= 0)
+        m_claudeModel->setCurrentIndex(listed);
+    else
+        m_claudeModel->setEditText(id);
+}
+
+QStringList LaunchPage::localModels() const {
+    QStringList models;
+    for (int i = 0; i < m_model->count(); ++i)
+        models << m_model->itemText(i);
+    const QString typed = m_model->currentText().trimmed();
+    if (!typed.isEmpty() && !models.contains(typed))
+        models.prepend(typed);
+    models.removeAll(QString());
+    return models;
 }
 
 void LaunchPage::settingsChanged() {
@@ -407,7 +448,8 @@ LaunchConfig LaunchPage::config() const {
     LaunchConfig c;
     c.model = m_model->currentText().trimmed();
     c.backend     = m_claudeBackend->isChecked() ? LaunchConfig::Backend::ClaudeCode : LaunchConfig::Backend::LocalModel;
-    c.claudeModel = m_claudeModel->currentText().trimmed();
+    c.claudeModel = claudeModelId();
+    c.effort      = effort::clamp(m_effort->level(), c.backend);
     c.mode  = m_scriptMode->isChecked() ? LaunchConfig::PromptMode::Script : LaunchConfig::PromptMode::Chat;
     for (auto it = m_tools.cbegin(); it != m_tools.cend(); ++it)
         if (it->enabled->isChecked())
@@ -448,7 +490,8 @@ bool LaunchPage::confirmStart(const LaunchConfig &c) {
     QSettings s;
     s.setValue("model", m_model->currentText().trimmed());
     s.setValue("backend", m_claudeBackend->isChecked() ? "claude" : "local");
-    s.setValue("claudeModel", m_claudeModel->currentText().trimmed());
+    s.setValue("claudeModel", claudeModelId());
+    s.setValue("effort", m_effort->level());
     s.setValue("scriptPath", m_scriptPath->text());
     s.setValue("scriptPrompt", m_scriptPrompt->toPlainText());
     return true;
@@ -458,7 +501,9 @@ void LaunchPage::setConfig(const LaunchConfig &c) {
     (c.backend == LaunchConfig::Backend::ClaudeCode ? m_claudeBackend : m_localBackend)->setChecked(true);
     if (!c.model.isEmpty())
         m_model->setCurrentText(c.model);
-    m_claudeModel->setCurrentText(c.claudeModel);
+    showClaudeModel(c.claudeModel);
+    m_effort->setBackend(c.backend);
+    m_effort->setLevel(c.effort);
     for (auto it = m_tools.begin(); it != m_tools.end(); ++it) {
         const auto chosen = std::find_if(c.tools.cbegin(), c.tools.cend(),
                                          [&](const ToolChoice &t) { return t.name == it.key(); });
@@ -520,6 +565,8 @@ void LaunchPage::updateBackendWidgets() {
                                            : QStringLiteral("%1 claude command found").arg(kGreenDot));
     m_claudeStatus->setToolTip(path);   // the path can be long (e.g. inside a VS Code extension)
     m_claudeStatus->setEnabled(claude);
+    if (m_effort)                       // each backend has its own levels (LaunchConfig.h)
+        m_effort->setBackend(claude ? LaunchConfig::Backend::ClaudeCode : LaunchConfig::Backend::LocalModel);
 }
 
 // ---- probing ------------------------------------------------------------------

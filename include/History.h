@@ -66,6 +66,7 @@ inline QJsonObject configToJson(const LaunchConfig &c) {
     return {{"backend", c.backend == LaunchConfig::Backend::ClaudeCode ? "claude" : "local"},
             {"model", c.model},
             {"claudeModel", c.claudeModel},
+            {"effort", c.effort},
             {"tools", tools},
             {"scriptPath", c.scriptPath}};
 }
@@ -76,6 +77,7 @@ inline LaunchConfig configFromJson(const QJsonObject &o, bool chat) {
                                                         : LaunchConfig::Backend::LocalModel;
     c.model       = o["model"].toString();
     c.claudeModel = o["claudeModel"].toString();
+    c.effort      = effort::clamp(o["effort"].toString(), c.backend);
     c.scriptPath  = o["scriptPath"].toString();
     c.mode        = chat ? LaunchConfig::PromptMode::Chat : LaunchConfig::PromptMode::Script;
     for (const QJsonValue &v : o["tools"].toArray())
@@ -83,11 +85,22 @@ inline LaunchConfig configFromJson(const QJsonObject &o, bool chat) {
     return c;
 }
 
-// Same model and tools? (What decides whether a running chat can be kept.)
+// Same model, effort and tools? (What decides whether a running chat can be kept.)
 inline bool sameSettings(const LaunchConfig &a, const LaunchConfig &b) {
     QJsonObject x = configToJson(a), y = configToJson(b);
     x.remove("scriptPath");
     y.remove("scriptPath");
+    return x == y;
+}
+
+// Same backend and tools, whatever the model and the effort? Then a running
+// agent can be handed the change; otherwise another one has to be started.
+inline bool sameBackendAndTools(const LaunchConfig &a, const LaunchConfig &b) {
+    QJsonObject x = configToJson(a), y = configToJson(b);
+    for (const char *key : {"scriptPath", "model", "claudeModel", "effort"}) {
+        x.remove(QLatin1String(key));
+        y.remove(QLatin1String(key));
+    }
     return x == y;
 }
 

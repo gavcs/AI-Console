@@ -11,6 +11,10 @@ downscaled dimensions, ...).
 
 A user message containing the word "slow" is answered one word every 0.1 s for
 10 s, so that a test can stop the reply half-way.
+
+A request for the model "strict-model" that carries any field outside the plain
+OpenAI ones is refused with HTTP 400, as a strict server would; such a refusal
+is not written to the capture file but counted in <capture>.refused.
 """
 import json
 import sys
@@ -20,6 +24,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 PORT = int(sys.argv[1])
 CAPTURE = sys.argv[2]
 REPLY = sys.argv[3] if len(sys.argv) > 3 else "ok, seen."
+PLAIN_FIELDS = {"model", "messages", "stream", "tools", "tool_choice"}
+refused = 0
 
 
 def last_user_text(body):
@@ -45,6 +51,18 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(n) or b"{}")
+        if body.get("model") == "strict-model" and set(body) - PLAIN_FIELDS:
+            global refused
+            refused += 1
+            with open(CAPTURE + ".refused", "w", encoding="utf-8") as f:
+                f.write(str(refused))
+            data = json.dumps({"error": {"message": "Unrecognized request argument"}}).encode()
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         with open(CAPTURE, "w", encoding="utf-8") as f:
             json.dump(body, f, indent=2)
         with open(CAPTURE + ".headers", "w", encoding="utf-8") as f:

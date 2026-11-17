@@ -126,6 +126,19 @@ QTextBrowser { background: transparent; border: none; }
 QTextBrowser#note { font-family: Menlo, Monaco, monospace; font-size: 11px; }
 QFrame#chip { background: %hover; border-radius: 8px; }
 
+/* the effort scale (EffortScale): #effortSlider and the level's name #effortName; chat model picker #chatModel */
+QSlider#effortSlider { min-height: 22px; }
+QSlider#effortSlider::groove:horizontal { height: 4px; background: %border; border-radius: 2px; }
+QSlider#effortSlider::sub-page:horizontal { background: %accent; border-radius: 2px; }
+QSlider#effortSlider::handle:horizontal { width: 14px; height: 14px; margin: -6px 0; border-radius: 8px;
+                                          background: %card; border: 2px solid %accent; }
+QSlider#effortSlider::handle:horizontal:hover { background: %accent; }
+QSlider#effortSlider::sub-page:horizontal:disabled { background: %subtle; }
+QSlider#effortSlider::handle:horizontal:disabled { border-color: %subtle; background: %window; }
+QLabel#effortName { font-weight: 600; }
+QLabel#effortName:disabled { color: %subtle; }
+QComboBox#chatModel { min-width: 190px; }
+
 QSplitter::handle { background: transparent; }
 QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
 QScrollBar::handle:vertical { background: %border; border-radius: 3px; min-height: 30px; }

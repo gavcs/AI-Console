@@ -1,7 +1,9 @@
 #include "MainWindow.h"
 
 #include <QCloseEvent>
+#include <QCoreApplication>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QHBoxLayout>
 #include <QInputDialog>
 #include <QLabel>
@@ -10,6 +12,7 @@
 #include <QMenu>
 #include <QMenuBar>
 #include <QMessageBox>
+#include <QProcess>
 #include <QPushButton>
 #include <QSettings>
 #include <QStackedWidget>
@@ -135,6 +138,13 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     for (ProcessPage *p : {m_server, m_scriptGen, m_scriptRun})
         connect(p, &ProcessPage::backRequested, this, &MainWindow::showLaunchPage);
     connect(m_chat, &ChatPage::backRequested, this, &MainWindow::showLaunchPage);
+    connect(m_chat, &ChatPage::settingsChangeRequested, this, &MainWindow::changeChatSettings);
+    connect(m_chat, &ChatPage::settingsChanged, this, [this](const LaunchConfig &config) {
+        statusBar()->showMessage(config.summary());
+        refreshSessions();
+    });
+    connect(m_server, &ProcessPage::started, this, [this] { m_serverStarted = true; });
+    connect(qApp, &QCoreApplication::aboutToQuit, this, &MainWindow::shutdown);
     connect(m_scriptGen, &ProcessPage::nextActionRequested, this, [this] { runScript(m_pending); });
 
     // ---- keeping the saved sessions up to date ----------------------------
@@ -214,14 +224,68 @@ void MainWindow::showAbout() {
 void MainWindow::closeEvent(QCloseEvent *event) {
     QSettings().setValue("window/geometry", saveGeometry());
     QMainWindow::closeEvent(event);
+    if (event->isAccepted()) {
+        hide();          // the window goes at once; stopping things may take a few seconds
+        shutdown();
+    }
+}
+
+MainWindow::~MainWindow() {
+    shutdown();
+}
+
+// ---- closing --------------------------------------------------------------------
+
+// Nothing the app started is left running behind it:
+//   - the chat agent, and with it the MCP servers it runs
+//   - a script run or a script being written
+//   - the services behind MCP servers that were started from here (their
+//     watcher is told to stop them; one that was already running is left
+//     alone), and the ssh tunnels to them
+//   - the model server, if "Start server" started it
+// What was started outside the app (a server in a terminal, a service that was
+// already up) is not the app's to stop.
+void MainWindow::shutdown() {
+    if (m_shutDown)
+        return;
+    m_shutDown = true;
+
+    m_chat->stopAgent();
+    m_scriptGen->stop();
+    m_scriptRun->stop();
+
+    // Ask every service watcher at once, then give them a common deadline.
+    for (ProcessPage *page : std::as_const(m_toolPages))
+        page->requestServiceShutdown();
+    QElapsedTimer waited;
+    waited.start();
+    constexpr int kServiceStopMs = 10000;
+    for (ProcessPage *page : std::as_const(m_toolPages)) {
+        page->waitForFinished(qMax(0, kServiceStopMs - int(waited.elapsed())));
+        page->stop();
+    }
+
+    m_server->stop();
+    // A server that runs outside the command that started it (LM Studio's
+    // "lms server start" returns at once) has a command of its own to stop it.
+    const QStringList stopCommand = QProcess::splitCommand(settings::current().stopCommand);
+    if (m_serverStarted && !stopCommand.isEmpty()) {
+        const QProcessEnvironment env = commands::environment();
+        QProcess stopper;
+        stopper.setProcessEnvironment(env);
+        stopper.start(commands::resolveProgram(stopCommand.first(), env), stopCommand.mid(1));
+        if (!stopper.waitForFinished(10000))
+            stopper.kill();
+    }
 }
 
 void MainWindow::showServerPage(const LaunchConfig &config, bool alreadyUp) {
     // Only launch if nothing is serving — neither our own process nor one
     // started from a terminal (which we can see but don't own).
-    const QString header = QStringLiteral("<b>Server</b> — %1").arg(config.shortModel());
+    const QString header = QStringLiteral("<b>Server</b> — %1").arg(config.model.section('/', -1));
     if (!m_server->isRunning()) {
         if (!alreadyUp) {
+            m_serverModel = config.model;
             m_server->begin(header, commands::serverCommand(config), commands::environment());
         } else if (!m_server->hasContent()) {
             m_server->showIdle(header, commands::serverCommand(config), commands::environment(),
@@ -299,10 +363,52 @@ void MainWindow::continueChat(const LaunchConfig &config) {
     }
     if (!confirmLeaveChat())
         return;
+    // Only the model or the effort changed: the running agent can take that.
+    const bool live = history::sameBackendAndTools(config, m_chatRecord.config) && m_chat->isAgentRunning() &&
+                      !m_chat->isBusy();
+    const bool serverRestarted = restartServerFor(config);
     m_chatRecord.config  = config;
     m_chatRecord.updated = QDateTime::currentDateTime();
     history::save(m_chatRecord);
-    startChat();
+    if (live) {
+        m_chat->applySettings(config, serverRestarted);
+        showChat();
+    } else {
+        startChat(serverRestarted);
+    }
+}
+
+// The model picker or the effort scale on the chat page: carry on with the
+// same conversation, answered by another model or at another effort level.
+void MainWindow::changeChatSettings(const LaunchConfig &config) {
+    if (!m_chatRecord.isValid())
+        return;
+    const bool live = history::sameBackendAndTools(config, m_chatRecord.config) && m_chat->isAgentRunning();
+    const bool serverRestarted = restartServerFor(config);
+    m_chatRecord.config  = config;
+    m_chatRecord.updated = QDateTime::currentDateTime();
+    history::save(m_chatRecord);
+    m_launch->setConfig(config);              // the start page shows what the chat uses
+    if (live)
+        m_chat->applySettings(config, serverRestarted);
+    else
+        startChat(serverRestarted);           // another backend: its agent takes over the saved conversation
+    statusBar()->showMessage(config.summary());
+    refreshSessions();
+}
+
+// A model server started from here with "{model}" in its command serves that
+// one model. When the chat moves to another local model, start it again with
+// the new one (the chat's next message waits for it; see agent.py).
+bool MainWindow::restartServerFor(const LaunchConfig &config) {
+    if (config.backend != LaunchConfig::Backend::LocalModel || config.model.isEmpty() ||
+        !m_server->isRunning() || config.model == m_serverModel ||
+        !settings::current().startCommand.contains(QLatin1String("{model}")))
+        return false;
+    m_serverModel = config.model;
+    m_server->begin(QStringLiteral("<b>Server</b> — %1").arg(config.model.section('/', -1)),
+                    commands::serverCommand(config), commands::environment());
+    return true;
 }
 
 void MainWindow::openSession(const QString &id) {
@@ -340,11 +446,12 @@ void MainWindow::openSession(const QString &id) {
     }
 }
 
-void MainWindow::startChat() {
+void MainWindow::startChat(bool waitForServer) {
     const LaunchConfig &config = m_chatRecord.config;
     const QString messages   = history::messagesPath(m_chatRecord);
-    const QString configPath = commands::writeSessionConfig(config, messages);
+    const QString configPath = commands::writeSessionConfig(config, messages, waitForServer);
     const bool claude = config.backend == LaunchConfig::Backend::ClaudeCode;
+    m_chat->setLocalModels(m_launch->localModels());
     m_chat->begin(config,
                   claude ? commands::claudeChatCommand(configPath, config) : commands::agentChatCommand(configPath),
                   commands::sessionEnvironment(configPath, config), messages);
@@ -353,6 +460,7 @@ void MainWindow::startChat() {
 }
 
 void MainWindow::showChat() {
+    m_chat->setLocalModels(m_launch->localModels());   // the server may have reported more since
     m_pages->setCurrentWidget(m_chat);
     statusBar()->showMessage(m_chatRecord.config.summary());
     refreshSessions();

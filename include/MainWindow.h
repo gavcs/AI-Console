@@ -20,19 +20,29 @@ class ProcessPage;
 //                             -> ProcessPage (script run)      (script, existing file)
 //                             -> ProcessPage (generator) --Run script--> ProcessPage (script run)
 //   LaunchPage --Continue------> ChatPage                      (the open chat, with the settings now selected)
+//   ChatPage   --model/effort--> ChatPage                      (the open chat, with another model or effort level)
 //   session list --------------> ChatPage / ProcessPage        (a saved chat / a saved script run)
 //   any page   --Back----------> LaunchPage
 //
 // Every chat and script run is saved (History.h). One chat is "open" at a
 // time: its agent keeps running while other pages are shown, so you can leave
 // it, look at a log or start a service, and come back.
+//
+// Closing the window (or quitting) stops everything the app started: the chat
+// agent and its MCP servers, scripts, the services behind MCP servers and
+// their tunnels, and the model server. See shutdown().
 class MainWindow : public QMainWindow {
     Q_OBJECT
 public:
     explicit MainWindow(QWidget *parent = nullptr);
+    ~MainWindow() override;
 
     // Open a saved session as if it had been clicked in the list.
     void openSession(const QString &id);
+
+    // Stop everything this app started. Called when the window closes and when
+    // the app quits; safe to call more than once.
+    void shutdown();
 
 protected:
     void closeEvent(QCloseEvent *event) override;
@@ -45,10 +55,14 @@ private:
     void showToolPage(const QString &toolName, const QString &location, bool alreadyUp);
     void startSession(const LaunchConfig &config);
     void continueChat(const LaunchConfig &config);
+    void changeChatSettings(const LaunchConfig &config);   // model / effort picked on the chat page
+    bool restartServerFor(const LaunchConfig &config);     // true = the model server is being restarted
     void runScript(const LaunchConfig &config);
     void showLaunchPage();
 
-    void startChat();                         // (re)start the agent for m_chatRecord and show it
+    // (Re)start the agent for m_chatRecord and show it. `waitForServer`: the
+    // model server was just restarted, so the first message waits for it.
+    void startChat(bool waitForServer = false);
     void showChat();
     void showScriptRun();
     bool confirmLeaveChat();                  // false = a reply is in progress and the user wants to keep it
@@ -70,4 +84,8 @@ private:
     LaunchConfig  m_pending;        // config of the script being generated
     SessionRecord m_chatRecord;     // the open chat (invalid = none)
     SessionRecord m_scriptRecord;   // the script run shown on m_scriptRun (invalid = none)
+
+    QString m_serverModel;            // the model the server page's command was last started with
+    bool    m_serverStarted = false;  // "Start server" ran here at least once (so the stop command applies)
+    bool    m_shutDown      = false;
 };

@@ -15,6 +15,11 @@ Code), tick the MCP servers it may use, then chat or run a Python script.
 - **Saved sessions**: every chat and script run is kept and can be reopened.
   Leave a conversation, come back to it, or continue it with a different model
   or different tools.
+- **Model and effort per conversation**: swap who answers from inside the chat
+  (one local model for another, Claude Fable 5.2 / Opus 5.5 / Sonnet 5.5 /
+  Haiku 5.5, or between the two kinds), and set how hard it thinks on a scale.
+- **Tidy exit**: closing the app stops what it started: the model server, the
+  agent and its MCP servers, services and ssh tunnels.
 - **Everything visible**: model server, ssh tunnels, agent and scripts each
   have a live log.
 
@@ -72,6 +77,13 @@ edited.
 - With no start command the app starts nothing and only shows whether the
   address answers. Use that for a server you start yourself, or one on another
   machine. An **API key** can be given for a server that wants one.
+- A server started with *Start server* is stopped when the app closes (see
+  [Closing the app](#closing-the-app)). The **stop command** is only for a
+  server that keeps running after its start command has returned, as LM
+  Studio's does (`lms server stop`).
+- A start command with `{model}` in it serves that one model. When a chat
+  moves to another local model, a server started from the app is started again
+  with the new one, and the chat's next message waits until it answers.
 - The **Models** list is what the Model box offers; anything else can be typed
   there. When a server is running, the models it reports are added.
 - The commands and model names above are starting points. Check your server's
@@ -88,8 +100,10 @@ the **claude** CLI is, and the folder generated scripts go to.
 Choose **Run with: Claude Code** on the start page. The chat works the same way,
 but replies come from the `claude` CLI, so no model server is needed.
 [Install Claude Code](https://claude.com/claude-code) and log in once from a
-terminal (`claude`, then `/login`). **Claude model** takes an alias (`opus`,
-`sonnet`, …) or a full model name; left empty, Claude Code uses its default.
+terminal (`claude`, then `/login`). **Claude model** lists the current models
+by name and number (Fable 5.2, Opus 5.5, Sonnet 5.5, Haiku 5.5), each pinned
+to exactly that model; any other model name or alias (`opus`, `sonnet`, …) can
+be typed, and left empty, Claude Code uses its default.
 
 - **Tools.** Claude gets the MCP servers ticked for the session and nothing
   else: Claude Code's own tools (shell, file editing, web) are switched off,
@@ -163,8 +177,10 @@ The service must answer HTTP on its port. `${SERVICE_URL}` and
 for where the service is reached on this Mac. For a remote service, Start
 opens **one ssh connection** that starts the service if needed, forwards the
 port, and shows the log; nothing has to be installed on the remote machine
-beyond ssh access with a key. Stop closes the watcher (and the tunnel); it
-never stops the service.
+beyond ssh access with a key. Stop closes the watcher (and the tunnel) and
+leaves the service running. Closing the app is different: a service that was
+started from the app is stopped with it, also on the remote machine, while
+one that was already running when you pressed Start is left alone.
 
 **`locations`** — the same tool can run in more than one place, and the start
 page offers a dropdown. Each entry is a server entry of its own plus an `id`
@@ -211,6 +227,42 @@ Ghidra that happens to be open on this Mac.
   are passed as a path that a tool can open.
 - Answers are rendered as Markdown; each tool call and its result is shown as
   one line.
+- Under the input are the **model picker** and the **effort scale**. Both apply
+  from your next message on, in the same conversation; see below.
+
+### Changing the model
+
+Pick another entry in the model picker: one of your local models, or Claude
+Code with its default model, Fable 5.2, Opus 5.5, Sonnet 5.5 or Haiku 5.5. The
+model you switch to gets the whole conversation, and each answer in the
+transcript is labelled with the model that wrote it.
+
+- From one local model to another, or one Claude model to another, the change
+  is immediate.
+- Between a local model and Claude Code the other backend is started on the
+  saved conversation, which takes a few seconds (it reconnects the MCP
+  servers).
+- The local models listed are the ones in Settings plus what the running
+  server reports. A server that serves one model at a time is restarted for
+  the new one if the app started it; see [Model servers](#model-servers).
+
+### Effort
+
+The scale sets how much the model thinks before it answers. **Default** says
+nothing and leaves it to the model.
+
+| | Levels | What is done |
+|---|---|---|
+| Claude Code | Low · Medium · High · Extra high · Max | Claude Code's own effort setting (`--effort`). Changing it restarts Claude Code, which resumes its copy of the conversation. |
+| Local model | Off · Low · Medium · High | Off switches a thinking model's reasoning off. The other levels ask for reasoning at that level, and Low and Medium also cap it. |
+
+There is no single way to ask an OpenAI-compatible server for this, so a
+request carries the fields the common servers read (`reasoning_effort`,
+`chat_template_kwargs.enable_thinking`, `thinking_token_budget`) and each
+server uses the ones it knows. How much difference a level makes therefore
+depends on the server and the model; a server that refuses the request because
+of these fields is asked again without them. The level is saved with the
+conversation, and the start page has the same scale for a new one.
 
 The model's reasoning is kept out of the answer and shown as a collapsed
 **Thinking…** block (click to open) that turns into "Thought for N s" when the
@@ -243,17 +295,34 @@ start a service, read a server log, or run a script, and then return with
 **Continue “…”** (or by clicking the chat in the sidebar). A reply that was
 being written when you left carries on in the background.
 
-To **switch models or add MCP servers mid-conversation**, go Back, change
-*Run with*, the model, or the ticked servers, and press **Continue “…”**. The
-agent restarts with the new settings and the same conversation. That works
-between any combination: one local model to another, local model to Claude
-Code, and back.
+To **add or remove MCP servers mid-conversation**, go Back, change the ticked
+servers (and, if you like, the model and the effort), and press
+**Continue “…”**. The agent restarts with the new settings and the same
+conversation. The model alone can be changed without leaving the chat; see
+[Changing the model](#changing-the-model). Either way it works between any
+combination: one local model to another, local model to Claude Code, and back.
 
 - A local model is always sent the complete conversation, tool calls included.
 - Claude Code resumes its own session when the conversation has only ever been
   with Claude Code. If part of it happened with a local model, a new Claude
   Code session is started and given the conversation so far as text (long tool
   results shortened, earlier images left out).
+
+## Closing the app
+
+Closing the window or quitting (also with Ctrl-C in the terminal the app was
+started from) stops everything the app started:
+
+- the chat's agent and the MCP servers it runs, and a script that is running;
+- services behind MCP servers that were started with their **Start** button,
+  on this Mac or over ssh, and the ssh tunnels to them;
+- the model server, if **Start server** started it, with everything it
+  started in turn.
+
+What you started yourself is not touched: a model server from a terminal, or a
+service that was already running when the app first looked. If the app is
+killed outright or crashes, the agent and its MCP servers still end by
+themselves, but a model server or a service it started may be left running.
 
 ## Scripts
 
@@ -285,11 +354,11 @@ data folder, `~/Library/Application Support/AI Console/AI Console/`
 |---|---|
 | `settings.json` | The Settings dialog. Absent until you change something; the defaults are then in effect. |
 | `mcp_servers.json` | Your MCP servers. |
-| `history/<id>/` | One folder per saved session: `meta.json` (kind, title, dates, the model and servers it last ran with), and for a chat `messages.json` (the conversation, in OpenAI chat format plus a few `_`-prefixed keys of the app's own that are never sent to a model; attached images are stored inside it) and `claude.json` (which Claude Code session holds it), or for a script run `output.log`. Deleting a folder deletes the session. |
+| `history/<id>/` | One folder per saved session: `meta.json` (kind, title, dates, the model, effort and servers it last ran with), and for a chat `messages.json` (the conversation, in OpenAI chat format plus a few `_`-prefixed keys of the app's own that are never sent to a model; attached images are stored inside it) and `claude.json` (which Claude Code session holds it), or for a script run `output.log`. Deleting a folder deletes the session. |
 | `model_traits.json` | What the app has learned about how a model marks its reasoning. |
 | `session.json`, `script_session.json`, `claude_mcp.json`, `claude_workspace/` | Working files for the session in progress. |
 
-The choices on the start page (last model, ticked servers) and the window's
+The choices on the start page (last model, effort, ticked servers) and the window's
 size are in the macOS preferences (`com.ai-console.AI Console`).
 
 ## Safety
@@ -340,12 +409,14 @@ needed and none of your settings are touched. See [tests/README.md](tests/README
 | `python/claude_agent.py` | The same chat protocol, answered by Claude Code: runs one `claude -p` process that connects to the session's MCP servers itself. |
 | `python/history.py` | The saved form of a conversation, shared by both backends. |
 | `python/gen_script.py` | "Write a script with Claude": runs `claude -p` with the agent contract as system prompt and saves the result. |
-| `python/service_watch.sh` | What a server's **Start** button runs when the server needs a background service: checks whether it is listening, starts it if not, prints what it reports about itself, copies new lines from its log, and keeps watching. Runs directly for a local service, or on the remote host through ssh. |
+| `python/service_watch.sh` | What a server's **Start** button runs when the server needs a background service: checks whether it is listening, starts it if not, prints what it reports about itself, copies new lines from its log, and keeps watching. Runs directly for a local service, or on the remote host through ssh. When the app closes it is told to stop the service it started. |
 | `python/mcp_files.py` | The read-only files MCP server behind the `files` preset. |
 | `python/ghidra_bridge.py` | Helper used by the Ghidra preset: starts the GhidraMCP bridge pointed at one specific Ghidra. |
 | `presets/*.json` | Ready-made server entries offered in the Add dialog. |
 | `include/Settings.h` | The settings and the provider presets. |
 | `include/Commands.h` | How things are run: the environment child processes get, and every command line. |
+| `include/LaunchConfig.h` | What a session is started with, the Claude models offered by name, and the effort levels each backend has. |
+| `include/ProcessUtil.h` | How a child process is stopped together with everything it started. |
 | `include/History.h` | Where saved sessions live on disk and what is in them. |
 | `include/Style.h` | The app's look: one palette and one stylesheet, light and dark, following the system setting. |
 

@@ -11,6 +11,7 @@
 #include "Commands.h"
 #include "LaunchConfig.h"
 
+class QComboBox;
 class QHBoxLayout;
 class QLabel;
 class QPlainTextEdit;
@@ -20,6 +21,7 @@ class QVBoxLayout;
 class ChatInput;
 class ChatMessageView;
 class ChatThinkingBlock;
+class EffortScale;
 
 // Session screen for PromptMode::Chat. Drives `python/agent.py chat`, which
 // owns the model <-> MCP tool loop, over a JSON-lines protocol on stdin/stdout
@@ -32,6 +34,12 @@ class ChatThinkingBlock;
 // The input takes several lines (Shift+Enter for a new line, Enter sends).
 // While a reply is being written the Send button is a Stop button; Esc does
 // the same.
+//
+// Under the input are the model picker and the effort scale. Changing either
+// applies from the next message on, in the same conversation. The page only
+// asks for the change (settingsChangeRequested); its owner answers with
+// applySettings() when the running agent can take it (same backend), or with
+// begin() when another backend has to be started.
 class ChatPage : public QWidget {
     Q_OBJECT
 public:
@@ -54,8 +62,18 @@ public:
     // the file dialog; also the headless-testable entry point).
     void addFiles(const QStringList &paths);
 
+    // The local models the model picker offers (Claude's are always listed).
+    void setLocalModels(const QStringList &models);
+    // Hand the running agent another model and/or effort level. `waitForServer`:
+    // the model server is being restarted for it, so the next message waits.
+    void applySettings(const LaunchConfig &config, bool waitForServer = false);
+    const LaunchConfig &config() const { return m_config; }
+
 signals:
     void backRequested();
+    // The user picked another model or effort level; `config` is the session's with that change.
+    void settingsChangeRequested(const LaunchConfig &config);
+    void settingsChanged(const LaunchConfig &config);   // ...and the agent has taken it
     void userMessageSent(const QString &text);   // the user sent a message (text may be empty: attachments only)
     void turnFinished();                         // the reply to it is complete
 
@@ -70,6 +88,8 @@ private:
     void onStderr();
     void handleEvent(const QJsonObject &ev);
     void setBusy(bool busy);
+    void syncControls();                      // show m_config in the model picker and the effort scale
+    void requestSettings(LaunchConfig config);
     void replay(const QString &messagesPath);          // show a saved conversation
     void addUserText(const QString &text);
     void log(const QString &text);            // log pane
@@ -92,6 +112,10 @@ private:
     QString      m_readyStatus;               // "ready · N tools", shown again after each turn
     bool         m_turnActive = false;        // between sending a message and its "done"
     bool         m_replayed   = false;        // the transcript started from a saved conversation
+    bool         m_configuring = false;       // between applySettings() and the agent's "configured"
+    LaunchConfig m_pendingConfig;             // what applySettings() asked for
+    bool         m_pendingWait = false;       // ...and whether the model server is being restarted for it
+    QStringList  m_localModels;
 
     QLabel         *m_header = nullptr;
     QLabel         *m_status = nullptr;
@@ -101,6 +125,8 @@ private:
     ChatInput      *m_input  = nullptr;
     QPushButton    *m_send   = nullptr;       // "Send", or "Stop" while a reply is being written
     QPushButton    *m_attach = nullptr;       // "Attach…" button
+    QComboBox      *m_modelBox = nullptr;     // who answers; itemData: {"local" | "claude", model id}
+    EffortScale    *m_effort   = nullptr;
     QWidget        *m_attachStrip  = nullptr; // row of chips for files queued for the next message
     QHBoxLayout    *m_attachLayout = nullptr;
     QStringList     m_pendingPaths;           // files queued for the next message (for display)

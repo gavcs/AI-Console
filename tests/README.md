@@ -32,24 +32,29 @@ Requires the same toolchain as the app (Qt 6 via Homebrew, `clang++`) plus a
   `-session` and would swallow it.
 - **`session_driver.cpp`** — walks the real `MainWindow` by clicking its
   widgets: start a chat with the local model, leave it, continue it with Claude
-  Code, continue it with the local model, stop a reply half-way, run a script,
+  Code, pick another Claude model and then the local model again in the chat's
+  model picker, move the effort scale, stop a reply half-way, run a script,
   filter the session list, then create a second window (an app restart) and
-  reopen both sessions. It also checks the settings: the defaults, the provider
-  presets, and how the server command is built from them. Flags:
-  `--script <file>`, `--shots <dir>`.
+  reopen both sessions. It also checks the settings (the defaults, the provider
+  presets, how the server command is built from them) and, with throwaway
+  services on free ports, that closing the window stops what the app started.
+  Flags: `--script <file>`, `--shots <dir>`.
 - **`backend_checks.py`** — starts `agent.py` and `claude_agent.py` the way the
   app does (JSON lines on stdin/stdout) and checks stopping a reply, how
-  reasoning is reported, and what ends up in the saved conversation.
+  reasoning is reported, changing the model and the effort level between
+  messages, and what ends up in the saved conversation.
 - **`fake_model.py`** — a stand-in for an OpenAI-compatible model server. It
   answers `/v1/models` and streams a reply to `/v1/chat/completions`, writing
   the request body (and its headers) to a capture file. A message containing
   "slow" is answered one word at a time for ten seconds, so a test can stop it.
+  Requests for the model `strict-model` are refused if they carry any field
+  beyond the plain OpenAI ones, as a strict server would.
 - **`fake_claude.py`** — a stand-in for the `claude` CLI, speaking enough of
   Claude Code's stream-json protocol for a turn with reasoning, a tool call and
   an answer; it records its command line and everything it was sent. "hidden"
   in a message makes it reason without sending the text, "slow" makes it
-  interruptible, and `FAKE_CLAUDE_OLD=1` makes it refuse `--thinking-display`
-  like an older Claude Code.
+  interruptible, and `FAKE_CLAUDE_OLD=1` makes it refuse `--thinking-display`,
+  `--effort` and a model change, like an older Claude Code.
 
 ## Overrides the app honours (used here)
 
@@ -74,6 +79,16 @@ Requires the same toolchain as the app (Qt 6 via Homebrew, `clang++`) plus a
 - **Reasoning**: Claude's reasoning summary is passed on as thinking; reasoning
   without text is still reported; a Claude Code without `--thinking-display` is
   started without it.
+- **Model and effort**: a chat's model changed from the chat page, within a
+  backend (handed to the running agent) and across backends (the other agent
+  takes over the conversation); the effort level sent to a local server as
+  thinking fields, dropped again for a server that refuses them, and passed to
+  Claude Code as `--effort` with the conversation resumed; a message waiting
+  for a model server that is still starting; the level kept with the saved
+  chat.
+- **Closing the app**: a service started from the app is stopped, one that
+  was already running is not, and a model server is stopped together with the
+  processes it started.
 - **Saved sessions**: `history.py` (saving, repairing a cut-off turn, keeping
   private keys from the model); the walk-through; that Claude Code is handed
   the local model's turns and the local model is handed Claude's, tool call

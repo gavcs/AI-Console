@@ -36,8 +36,14 @@ public:
     bool isRunning() const { return m_process.state() != QProcess::NotRunning; }
     // Everything shown on the page so far.
     QString output() const;
-    // Stop the process (if running) and wait for it; finished() is emitted before this returns.
+    // Stop the process (if running) and everything it started, and wait for
+    // it; finished() is emitted before this returns.
     void stop();
+    // For a page that runs python/service_watch.sh, when the app is closing:
+    // tell the watcher to stop the service it started and end. Returns at
+    // once; follow it with waitForFinished() and then stop().
+    void requestServiceShutdown();
+    bool waitForFinished(int ms) { return !isRunning() || m_process.waitForFinished(ms); }
     // True once begin()/showIdle() has put something on this page.
     bool hasContent() const { return m_cmd.isValid(); }
 

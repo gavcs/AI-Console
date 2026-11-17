@@ -7,6 +7,8 @@
 #include <QTextCursor>
 #include <QVBoxLayout>
 
+#include "ProcessUtil.h"
+
 ProcessPage::ProcessPage(QWidget *parent) : QWidget(parent) {
     auto *back = new QPushButton("← Back");
     back->setFlat(true);
@@ -44,6 +46,7 @@ ProcessPage::ProcessPage(QWidget *parent) : QWidget(parent) {
 
     // Interleave stdout and stderr in the order they arrive.
     m_process.setProcessChannelMode(QProcess::MergedChannels);
+    proc::ownGroup(m_process);   // so that stop() reaches what the command starts
 
     connect(&m_process, &QProcess::readyRead, this, [this] {
         appendOutput(QString::fromLocal8Bit(m_process.readAll()));
@@ -118,13 +121,16 @@ QString ProcessPage::output() const {
 }
 
 void ProcessPage::stop() {
+    proc::stop(m_process);                 // SIGTERM first so servers can shut down cleanly
+}
+
+void ProcessPage::requestServiceShutdown() {
     if (!isRunning())
         return;
-    m_process.terminate();                 // SIGTERM first so servers can shut down cleanly
-    if (!m_process.waitForFinished(3000)) {
-        m_process.kill();
-        m_process.waitForFinished(1000);
-    }
+    // The watcher reads its stdin (see "shutdown" in python/service_watch.sh);
+    // for a remote service the line travels over the ssh connection.
+    m_process.write("shutdown\n");
+    m_process.closeWriteChannel();
 }
 
 void ProcessPage::appendOutput(const QString &text) {

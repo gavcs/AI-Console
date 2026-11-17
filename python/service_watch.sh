@@ -17,7 +17,12 @@
 #   HINT        printed if the service has not come up after a minute
 #
 # Stopping this script (SIGTERM, or stdin closing because ssh/the app went
-# away) never stops the service itself.
+# away) never stops the service itself: closing a log or losing a connection
+# must not take a running service down.
+#
+# The one exception is the line "shutdown" on stdin, which the app sends when
+# it is being closed: the service is then stopped too, if this run started it.
+# A service that was already running when the watching began is left alone.
 
 NAME=${NAME:-service}
 START_CMD=${START_CMD:-}
@@ -35,6 +40,7 @@ if [ -z "${PORT:-}" ]; then
 fi
 
 bg_pids=""
+svc_pid=""                            # the service's process group, if this run started it
 cleanup() {
     for p in $bg_pids; do kill "$p" 2>/dev/null; done
 }
@@ -43,12 +49,50 @@ trap 'exit 0' TERM INT HUP
 
 listening() { (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; }
 
+# Send signal $1 to the service this run started: to its process group, and to
+# whatever listens on its port in case it moved itself into the background.
+signal_service() {
+    kill -"$1" -- "-$svc_pid" 2>/dev/null || kill -"$1" "$svc_pid" 2>/dev/null
+    if command -v lsof >/dev/null 2>&1; then
+        local p
+        for p in $(lsof -nP -t -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null); do
+            kill -"$1" "$p" 2>/dev/null
+        done
+    fi
+}
+
+service_alive() { kill -0 -- "-$svc_pid" 2>/dev/null || listening; }
+
+# The app is closing ("shutdown" on stdin): stop the service as well.
+shutdown_service() {
+    if [ -z "$svc_pid" ]; then
+        log "$NAME was running before this started watching it, so it is left running"
+        exit 0
+    fi
+    log "the app is closing: stopping $NAME"
+    signal_service TERM
+    local i=0
+    while service_alive && [ "$i" -lt 12 ]; do
+        sleep 0.5
+        i=$((i + 1))
+    done
+    if service_alive; then
+        log "$NAME did not stop when asked; ending it"
+        signal_service KILL
+    fi
+    log "$NAME stopped"
+    exit 0
+}
+
 # Sleep $1 seconds. Reading stdin is the sleep: when stdin reaches EOF the
 # caller (ssh session or the app) is gone, so stop instead of lingering.
 pause() {
-    local t0=$SECONDS junk
-    if read -r -t "$1" junk; then
-        return 0                      # a stray line on stdin: ignore it
+    local t0=$SECONDS line
+    if read -r -t "$1" line; then
+        if [ "$line" = "shutdown" ]; then
+            shutdown_service
+        fi
+        return 0                      # any other line on stdin: ignore it
     fi
     if [ $((SECONDS - t0)) -lt "$1" ]; then
         exit 0                        # returned early without data: EOF
@@ -104,11 +148,18 @@ else
     out="${TMPDIR:-/tmp}/ai-console-$NAME.out"
     : > "$out"
     log "$NAME is not running. Starting it: $START_CMD"
+    # In a process group of its own: stopping this script then leaves it
+    # running, and "shutdown" can stop all of it.
     if command -v setsid >/dev/null 2>&1; then
         setsid nohup bash -c "$START_CMD" >"$out" 2>&1 </dev/null &
+        svc_pid=$!
     else
+        set -m                        # job control: a background job gets its own group
         nohup bash -c "$START_CMD" >"$out" 2>&1 </dev/null &
+        svc_pid=$!
+        set +m
     fi
+    disown "$svc_pid" 2>/dev/null
     tail -n +1 -F "$out" 2>/dev/null &      # whatever the start command prints
     bg_pids="$bg_pids $!"
 
@@ -128,7 +179,11 @@ fi
 
 show_info
 [ -n "$READY_NOTE" ] && log "$READY_NOTE"
-log "watching $NAME. Stopping this only stops watching; $NAME keeps running."
+if [ -n "$svc_pid" ]; then
+    log "watching $NAME. Stopping this only stops watching; $NAME itself is stopped when the app is closed."
+else
+    log "watching $NAME. It was already running, so it keeps running when this stops or the app is closed."
+fi
 
 state=up
 while :; do

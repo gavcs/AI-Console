@@ -4,7 +4,8 @@
 # The real widgets and the real python/ backends run against a scripted fake
 # model server (fake_model.py) and a fake claude CLI (fake_claude.py), which
 # record what the app sent them. Covers attachments, both backends, stopping a
-# reply, saved sessions and the settings.
+# reply, changing the model and the effort level in a chat, saved sessions, the
+# settings, and that closing the app stops what it started.
 #
 #   make test            # builds the driver, then runs this
 #   bash tests/run_tests.sh [path-to-chat_driver]
@@ -263,7 +264,7 @@ else
         "$SESSION_DRIVER" --script "$TMP/hello.py" --shots "${SHOTS:-$TMP/shots}" 2>"$TMP/session_driver.log")"
     DRIVER_RC=$?
     { kill "$SRV" && wait "$SRV"; } 2>/dev/null; SRV=""
-    if [ "$DRIVER_RC" -eq 0 ]; then ok "settings, start, leave, switch model, continue, stop a reply, script run, restart, reopen"
+    if [ "$DRIVER_RC" -eq 0 ]; then ok "settings, closing stops what was started, start, leave, switch model and effort, continue, stop a reply, script run, restart, reopen"
     else bad "session walk-through (driver exit $DRIVER_RC)"; grep -E "FAILED|timed out" "$TMP/session_driver.log"; fi
 
     if "$PYTHON" - "$TMP/history/$CHAT_ID" "$TMP/model_cap.json" "$TMP/claude_cap.json" <<'PY' 2>>"$TMP/driver.log" | grep -q ASSERTS_OK
@@ -272,11 +273,14 @@ conv, model_cap, claude_cap = sys.argv[1:]
 meta = json.load(open(conv + "/meta.json"))
 assert meta["kind"] == "chat" and meta["title"] == "first question", meta
 assert meta["config"]["backend"] == "local", "settings follow the last switch"
+assert meta["config"]["effort"] == "low" and meta["config"]["claudeModel"] == "claude-opus-5-5", meta
 msgs = json.load(open(conv + "/messages.json"))["messages"]
 users = [m["_text"] for m in msgs if m["role"] == "user"]
-assert users == ["first question", "second question", "third question", "a slow question", "fourth question"], users
+assert users == ["first question", "second question", "opus question", "third question", "a slow question",
+                 "fourth question"], users
 who = [m.get("_model") for m in msgs if m["role"] == "assistant"]
-assert "Claude Code" in who and who[0] != "Claude Code" and who[-1] != "Claude Code", who
+assert "Claude Code" in who and "Claude Opus 5.5" in who, who
+assert not who[0].startswith("Claude") and not who[-1].startswith("Claude"), who
 cut = [m for m in msgs if m.get("_stopped")]
 assert len(cut) == 1 and cut[0]["content"].startswith("word0 ") and "word99" not in cut[0]["content"], cut
 assert any(m.get("_thinking") == "Let me look that up." for m in msgs), "Claude's reasoning saved"
@@ -286,8 +290,13 @@ first = [m for m in claude["stdin"] if m["type"] == "user"][0]["message"]["conte
 assert "first question" in first[0]["text"] and "ok, seen." in first[0]["text"], first
 assert first[-1]["text"] == "second question", first
 assert "--session-id" in claude["argv"] and "--no-session-persistence" not in claude["argv"]
+# the other Claude model was handed to the Claude Code that was already running
+asked = [m["request"] for m in claude["stdin"] if m["type"] == "control_request" and m["request"]["subtype"] == "set_model"]
+assert asked == [{"subtype": "set_model", "model": "claude-opus-5-5"}], asked
 # the local model was sent the whole conversation, Claude's tool call included, and none of our private keys
-sent = json.load(open(model_cap))["messages"]
+body = json.load(open(model_cap))
+sent = body["messages"]
+assert body.get("reasoning_effort") == "low", "the effort level is kept with the chat and used after a restart"
 assert [m["content"] for m in sent if m["role"] == "user"] == users, sent
 assert any(m.get("tool_calls") for m in sent) and any(m["role"] == "tool" for m in sent), sent
 assert not any(k.startswith("_") for m in sent for k in m), sent
@@ -299,7 +308,7 @@ assert rm["finished"] and rm["exitCode"] == 0 and rm["title"] == "hello.py", rm
 assert "hello from the script" in open(runs[0] + "/output.log").read()
 print("ASSERTS_OK")
 PY
-    then ok "conversation handed local -> Claude Code -> local intact; script output saved"
+    then ok "conversation handed local -> Claude Code -> another Claude model -> local intact; effort kept; script output saved"
     else bad "saved session contents"; fi
 fi
 

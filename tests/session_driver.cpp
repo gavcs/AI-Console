@@ -1,10 +1,12 @@
 // session_driver — a headless walk through the app, for tests.
 //
 // Drives the real MainWindow by clicking its widgets: start a chat with the
-// local model, leave it, continue it with Claude Code, continue it with the
-// local model again, stop a reply half-way, run a script, then "restart the
-// app" (a second MainWindow) and reopen both from the session list. It also
-// checks the settings: provider presets and how the server command is built.
+// local model, leave it, continue it with Claude Code, pick another Claude
+// model and then the local model again from the chat page itself, change the
+// effort level, stop a reply half-way, run a script, then "restart the app" (a
+// second MainWindow) and reopen both from the session list. It also checks the
+// settings (provider presets, how the server command is built) and that
+// closing the window stops what the app started.
 //
 // Nothing real is used and nothing of the user's is touched:
 //   AI_CONSOLE_SERVER_PORT   port of tests/fake_model.py (instead of the model server)
@@ -19,9 +21,11 @@
 
 #include "ChatPage.h"
 #include "Commands.h"
+#include "EffortScale.h"
 #include "History.h"
 #include "LaunchPage.h"
 #include "MainWindow.h"
+#include "McpServers.h"
 #include "ProcessPage.h"
 #include "SettingsDialog.h"
 #include "Style.h"
@@ -36,12 +40,18 @@
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QRadioButton>
+#include <QSettings>
+#include <QSlider>
 #include <QStackedWidget>
+#include <QTcpServer>
 #include <QTextBrowser>
 #include <QTimer>
 #include <QToolButton>
+#include <arpa/inet.h>
 #include <cstdio>
 #include <functional>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 static int failures = 0;
@@ -114,6 +124,98 @@ static int notes(ChatPage *chat, const QString &text) {
     return n;
 }
 
+// Choose an entry of the chat page's model picker, as a click on it would.
+static bool pickModel(ChatPage *chat, const QString &backend, const QString &model) {
+    auto *box = chat->findChild<QComboBox *>("chatModel");
+    const int index = box ? box->findData(QStringList{backend, model}) : -1;
+    if (index < 0 || !box->isEnabled())
+        return false;
+    box->setCurrentIndex(index);
+    emit box->activated(index);
+    return true;
+}
+
+static QString header(ChatPage *chat) {
+    return chat->findChild<QLabel *>("pageHeader")->text();
+}
+
+static int freePort() {
+    QTcpServer s;
+    s.listen(QHostAddress::LocalHost, 0);
+    return s.serverPort();
+}
+
+// Is something listening on `port`? Asked with a plain socket: it must not
+// take the port itself, even for a moment, while a service is about to bind it.
+static bool listening(int port) {
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+        return false;
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(uint16_t(port));
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    const bool up = ::connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof addr) == 0;
+    ::close(fd);
+    return up;
+}
+
+// ---- closing the app: nothing it started is left behind -----------------------
+
+static void checkShutdown() {
+    fprintf(stderr, "closing the window\n");
+    const QList<ServerConfig> before = commands::servers();
+    const AppSettings saved = settings::current();
+    const int servicePort = freePort(), keptPort = freePort(), workerPort = freePort();
+
+    // A service the app is asked to start, and one that is already running.
+    QString error;
+    const QString json = QStringLiteral(
+        R"({"started": {"command": "true", "service": {"port": %1, "start": "exec python3 -m http.server %1 --bind 127.0.0.1"}},
+            "kept":    {"command": "true", "service": {"port": %2, "start": "false"}}})").arg(servicePort).arg(keptPort);
+    const QList<ServerConfig> servers = mcp::parseServers(json.toUtf8(), &error);
+    check(servers.size() == 2 && commands::setServers(servers, &error), "two servers with a service configured");
+    if (!error.isEmpty())
+        fprintf(stderr, "    %s\n", qPrintable(error));
+    QProcess already;
+    already.start("python3", {"-m", "http.server", QString::number(keptPort), "--bind", "127.0.0.1"});
+    // A "model server" that is a shell with a worker of its own: stopping the shell must stop the worker.
+    settings::current().startCommand =
+        QStringLiteral("sh -c \"python3 -m http.server %1 --bind 127.0.0.1 & wait\"").arg(workerPort);
+    check(waitFor([&] { return listening(keptPort); }, 8000), "a service is already running before the app starts");
+    {
+        MainWindow window;
+        window.show();
+        auto *launch = window.findChild<LaunchPage *>();
+        emit launch->toolPageRequested("started", "local", false);
+        emit launch->toolPageRequested("kept", "local", true);
+        for (ProcessPage *page : window.findChildren<ProcessPage *>())      // the page of "kept" was only shown idle
+            if (page->output().contains("already answers"))
+                byText<QPushButton>(page, "Run again")->click();
+        emit launch->serverPageRequested(launch->config(), false);
+        check(waitFor([&] { return listening(servicePort); }, 15000), "the service is started from the app");
+        check(waitFor([&] { return listening(workerPort); }, 15000), "the model server is started, and starts its worker");
+        if (!listening(servicePort) || !listening(workerPort))
+            for (ProcessPage *page : window.findChildren<ProcessPage *>())
+                fprintf(stderr, "---- page output ----\n%s\n", qPrintable(page->output()));
+        waitFor([] { return false; }, 1500);          // let the watcher of "kept" see that it is running
+        QElapsedTimer t;
+        t.start();
+        window.close();
+        // (a process that was just killed may take a moment to let go of its port)
+        check(waitFor([&] { return !listening(servicePort); }, 2000),
+              "closing the window stops a service that was started from the app");
+        check(waitFor([&] { return !listening(workerPort); }, 2000),
+              "...and the model server together with what it started");
+        check(listening(keptPort), "...but not a service that was already running");
+        check(t.elapsed() < 12000, "closing does not take long");
+    }
+    already.kill();
+    already.waitForFinished(2000);
+    settings::current() = saved;
+    commands::setServers(before, &error);
+}
+
 // ---- settings: no window needed ---------------------------------------------
 
 static void checkSettings() {
@@ -167,7 +269,12 @@ int main(int argc, char **argv) {
     // A question box nobody can click would hang the run: give up instead.
     QTimer::singleShot(170000, [] { fprintf(stderr, "session_driver: timed out\n"); _exit(3); });
 
+    // Choices an earlier run left behind would change what this one starts with.
+    for (const char *key : {"effort", "claudeModel"})
+        QSettings().remove(key);
+
     checkSettings();
+    checkShutdown();
 
     QString chatId;
     {
@@ -208,12 +315,31 @@ int main(int argc, char **argv) {
         check(list->count() == 1, "still one saved chat");
         shot(window, "4-chat-claude");
 
-        fprintf(stderr, "switch back to the local model, continue\n");
-        byText<QPushButton>(chat, "← Back")->click();
-        byText<QRadioButton>(launch, "Local model")->click();
-        cont->click();
+        fprintf(stderr, "another Claude model, from the chat page\n");
+        auto *input = chat->findChild<QPlainTextEdit *>("chatInput");
+        check(pickModel(chat, "claude", "claude-opus-5-5"), "Claude models are listed by name and number");
+        check(waitFor([&] { return input->isEnabled(); }) && header(chat).contains("Claude Opus 5.5") &&
+                  notes(chat, "Changed — now answering: Claude Opus 5.5") == 1 && speakers(chat) == 4,
+              "the model changes in the running chat, with the conversation as it was");
+        check(say(chat, "opus question"), "next turn answered by the new Claude model");
+        check(launch->config().claudeModel == "claude-opus-5-5", "the start page shows the model the chat uses now");
+
+        fprintf(stderr, "back to the local model, from the chat page\n");
+        check(pickModel(chat, "local", "test-model"), "the local model is offered in the chat's model picker");
+        check(waitFor([&] { return input->isEnabled(); }) && speakers(chat) == 6 && !header(chat).contains("Claude"),
+              "the local model's agent takes over the conversation");
         check(say(chat, "third question"), "third turn answered by the local model");
-        check(speakers(chat) == 6, "three questions and three answers on screen");
+        check(speakers(chat) == 8, "four questions and four answers on screen");
+
+        fprintf(stderr, "effort\n");
+        auto *scale = chat->findChild<EffortScale *>("chatEffort");
+        check(scale && scale->level().isEmpty() && effort::levels(LaunchConfig::Backend::LocalModel).value(2) == "low",
+              "the effort scale starts at Default");
+        scale->findChild<QSlider *>()->setValue(2);
+        check(waitFor([&] { return input->isEnabled() && notes(chat, "Changed — effort: low") == 1; }) &&
+                  header(chat).contains("effort: low") && scale->level() == "low",
+              "moving the scale changes the effort in the running chat");
+        shot(window, "4b-model-and-effort");
 
         fprintf(stderr, "stop a reply half-way\n");
         check(type(chat, "a slow question"), "slow question sent");
@@ -258,7 +384,8 @@ int main(int argc, char **argv) {
         auto *list  = window.findChild<QListWidget *>("sessions");
         check(list->count() == 2, "both sessions listed after a restart");
         window.openSession(chatId);
-        check(pages->currentWidget() == chat && speakers(chat) == 8, "saved conversation shown again");
+        check(pages->currentWidget() == chat && speakers(chat) == 10, "saved conversation shown again");
+        check(chat->findChild<EffortScale *>("chatEffort")->level() == "low", "with the effort level it was left at");
         check(notes(chat, "[stopped]") == 1 && byText<QToolButton>(chat, "Thought") != nullptr,
               "with the stopped reply and the reasoning");
         check(say(chat, "fourth question"), "conversation continues after a restart");

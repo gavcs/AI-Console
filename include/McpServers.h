@@ -200,8 +200,9 @@ inline QList<ServerConfig> parseServers(const QByteArray &json, QString *error) 
         return {};
     }
     QJsonObject root = doc.object();
-    if (root["mcpServers"].isObject())
-        root = root["mcpServers"].toObject();
+    // value(), not []: on an object that can be changed, [] adds the key it was asked for.
+    if (root.value("mcpServers").isObject())
+        root = root.value("mcpServers").toObject();
     else if (root.contains("command") || root.contains("url")) {
         *error = QStringLiteral("This is a single server without a name. Wrap it: {\"name\": { ... }}.");
         return {};
@@ -444,7 +445,10 @@ inline const McpTool *findTool(const QString &name) {
 // ---- session config for agent.py -----------------------------------------
 // Writes the JSON agent.py reads and returns its path. `historyPath` (chats
 // only) is where the backend keeps the conversation: see History.h.
-inline QString writeSessionConfig(const LaunchConfig &c, const QString &historyPath = QString()) {
+// `waitForServer`: the model server was just (re)started, so the first message
+// should wait for it to answer instead of failing.
+inline QString writeSessionConfig(const LaunchConfig &c, const QString &historyPath = QString(),
+                                  bool waitForServer = false) {
     QJsonArray servers;
     for (const ToolChoice &choice : c.tools)
         if (const McpTool *t = findTool(choice.name))
@@ -454,6 +458,10 @@ inline QString writeSessionConfig(const LaunchConfig &c, const QString &historyP
                     {"model", c.model},
                     {"label", c.shortModel()},
                     {"mcp_servers", servers}};
+    if (!c.effort.isEmpty())
+        cfg["effort"] = c.effort;
+    if (waitForServer)
+        cfg["wait_for_server"] = true;
     if (!historyPath.isEmpty())
         cfg["history"] = historyPath;
     if (!settings::current().apiKey.isEmpty())

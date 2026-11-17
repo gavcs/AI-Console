@@ -64,6 +64,8 @@ SettingsDialog::SettingsDialog(const AppSettings &current, QWidget *parent) : QD
     m_start = new QLineEdit(current.startCommand);
     m_start->setPlaceholderText("nothing: the server is started somewhere else");
     m_start->setCursorPosition(0);            // show the start of a long command, not its end
+    m_stop = new QLineEdit(current.stopCommand);
+    m_stop->setPlaceholderText("nothing: stopping the start command stops the server");
     m_models = new QPlainTextEdit(current.models.join('\n'));
     m_models->setPlaceholderText("one model id per line");
     m_models->setFixedHeight(64);
@@ -81,6 +83,10 @@ SettingsDialog::SettingsDialog(const AppSettings &current, QWidget *parent) : QD
     serverForm->addRow(QString(), hint("What “Start server” runs. {model} becomes the model chosen on the start page, "
                                        "{port} and {host} come from the address. Leave it empty if the server is "
                                        "started elsewhere; the app then only shows whether it is reachable."));
+    serverForm->addRow("Stop command:", m_stop);
+    serverForm->addRow(QString(), hint("A server started with “Start server” is stopped when the app closes. Only a "
+                                       "server that keeps running after its start command has returned needs a "
+                                       "command here to stop it."));
     serverForm->addRow("Models:", m_models);
     serverForm->addRow("API key:", m_apiKey);
     serverForm->addRow(QString(), hint("Only for a server that asks for one. It is stored as plain text in settings.json."));
@@ -142,6 +148,7 @@ void SettingsDialog::applyProvider(const Provider &p) {
     m_baseUrl->setText(p.baseUrl);
     m_start->setText(p.startCommand);
     m_start->setCursorPosition(0);
+    m_stop->setText(p.stopCommand);
     m_models->setPlainText(p.model);
 }
 
@@ -154,6 +161,7 @@ void SettingsDialog::accept() {
     m_result.provider     = m_provider->currentData().toString();
     m_result.baseUrl      = m_baseUrl->text().trimmed();
     m_result.startCommand = m_start->text().trimmed();
+    m_result.stopCommand  = m_stop->text().trimmed();
     m_result.models.clear();
     for (const QString &line : m_models->toPlainText().split('\n', Qt::SkipEmptyParts))
         if (!line.trimmed().isEmpty())

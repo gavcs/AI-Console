@@ -30,6 +30,14 @@ still marks that reasoning took place, so the chat shows "Thinking..." either wa
 Stopping: {"type":"stop"} interrupts the reply being written (Claude Code's own
 interrupt request). What was written so far is kept, here and in Claude Code.
 
+Model and effort: the model comes from --model, the effort ("low" to "max",
+Claude Code's --effort) from the session config. Both can be changed between
+messages with {"type":"configure"}: another model is a request to the running
+Claude Code (set_model), which keeps the conversation as it is; another effort
+level can only be given when Claude Code starts, so it is restarted and resumes
+its own copy of the conversation. A Claude Code version that knows neither is
+restarted with --model, or started without --effort.
+
 Saved conversations (the session config's "history" file, see history.py):
 every turn is written to that file in the same form agent.py uses, so a
 conversation can move between a local model and Claude. Claude Code also keeps
@@ -63,6 +71,7 @@ Event = dict[str, Any]
 
 MCP_CONNECT_TIMEOUT = 45.0     # seconds to wait for the MCP servers before starting without them
 MAX_TOOL_RESULT_CHARS = 30000  # cap on a tool result passed on to the chat page (it shows a preview)
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")   # what `claude --effort` takes
 
 SYSTEM_NOTE = (
     "You are being used through AI Console, a desktop chat window, not a terminal or an IDE. "
@@ -183,6 +192,9 @@ class ClaudeSession:
         self.proc: asyncio.subprocess.Process | None = None
         self._req = 0
         self.label = cfg.get("label") or ("Claude Code" + (f" ({model})" if model else ""))
+        self.effort = cfg.get("effort") if cfg.get("effort") in EFFORT_LEVELS else ""
+        self.pass_effort = True             # pass --effort (a Claude Code version without it is started without)
+        self.tools: list[str] = []          # what the MCP servers offered at the last start
         self.history = saved.History(cfg.get("history") or "")
         # Which Claude Code session holds this conversation, and how many of the
         # saved messages it has seen (kept next to the history file).
@@ -220,10 +232,14 @@ class ClaudeSession:
                 break
             except StartFailed:
                 await self.stop()                       # also collects the rest of what it printed
-                if self.ask_for_reasoning and "thinking-display" in " ".join(self._stderr):
+                said = " ".join(self._stderr)
+                if self.ask_for_reasoning and "thinking-display" in said:
                     self.ask_for_reasoning = False
                     log("[claude] this Claude Code version cannot be asked for its reasoning; "
                         "replies will show that it thought, without the text")
+                elif self.effort and self.pass_effort and "--effort" in said:
+                    self.pass_effort = False
+                    log("[claude] this Claude Code version has no effort setting; using its default")
                 elif resume:
                     resume = ""
                     log("[claude] Claude Code no longer has this conversation; starting it again from the saved copy")
@@ -235,6 +251,7 @@ class ClaudeSession:
             self.carry_over = saved.transcript(self.history.messages)
             log(f"[claude] continuing a saved conversation ({len(self.history.messages)} messages) "
                 "in a new Claude Code session")
+        self.tools = tools
         return tools
 
     async def _launch(self, resume: str) -> list[str]:
@@ -264,6 +281,8 @@ class ClaudeSession:
             cmd += ["--allowedTools", ",".join(allowed)]
         if self.model:
             cmd += ["--model", self.model]
+        if self.effort and self.pass_effort:
+            cmd += ["--effort", self.effort]
         if not self.history.path:
             cmd += ["--no-session-persistence"]                # nothing to come back to
         elif resume:
@@ -313,14 +332,14 @@ class ClaudeSession:
             if isinstance(msg, dict):
                 return msg
 
-    def _request(self, subtype: str) -> tuple[str, dict[str, Any]]:
+    def _request(self, subtype: str, **fields: Any) -> tuple[str, dict[str, Any]]:
         self._req += 1
         rid = f"console-{self._req}"
-        return rid, {"type": "control_request", "request_id": rid, "request": {"subtype": subtype}}
+        return rid, {"type": "control_request", "request_id": rid, "request": {"subtype": subtype, **fields}}
 
-    async def _control(self, subtype: str) -> dict[str, Any] | None:
-        """Ask Claude Code something outside the conversation. None if it exited."""
-        rid, request = self._request(subtype)
+    async def _control_response(self, subtype: str, **fields: Any) -> dict[str, Any] | None:
+        """Ask Claude Code something outside the conversation; its whole answer. None if it exited."""
+        rid, request = self._request(subtype, **fields)
         try:
             await self._send(request)
         except (BrokenPipeError, ConnectionResetError):
@@ -331,7 +350,39 @@ class ClaudeSession:
                 return None
             resp = msg.get("response") or {}
             if msg.get("type") == "control_response" and resp.get("request_id") == rid:
-                return resp.get("response") or {}
+                return resp
+
+    async def _control(self, subtype: str) -> dict[str, Any] | None:
+        """The payload of Claude Code's answer to a request. None if it exited."""
+        resp = await self._control_response(subtype)
+        return None if resp is None else resp.get("response") or {}
+
+    async def configure(self, msg: dict[str, Any]) -> Event:
+        """Change the model and/or the effort between two messages (see "Model and effort")."""
+        model = msg["model"] if isinstance(msg.get("model"), str) else self.model
+        wanted = msg.get("effort", self.effort)
+        effort = wanted if wanted in EFFORT_LEVELS else ""
+        if isinstance(msg.get("label"), str) and msg["label"]:
+            self.label = msg["label"]
+        restart = effort != self.effort and self.pass_effort
+        self.effort = effort
+        if model != self.model:
+            self.model = model
+            if not restart:
+                # Empty = back to Claude Code's own default, which only a start without --model gives.
+                resp = await self._control_response("set_model", model=model) if model else {"subtype": "error"}
+                if resp is None or resp.get("subtype") != "success":
+                    restart = True
+                else:
+                    log(f"[claude] model changed to {model}")
+        if restart:
+            log("[claude] restarting Claude Code with"
+                + (f" model {self.model}" if self.model else " its default model")
+                + (f", effort {self.effort}" if self.effort else ""))
+            await self.stop()
+            await self.start()
+        return {"type": "configured", "model": self.model, "label": self.label,
+                "effort": self.effort, "tools": self.tools}
 
     async def _wait_for_servers(self) -> list[str]:
         # Claude Code says nothing until the first message, so ask it how its
@@ -544,6 +595,8 @@ async def chat_main(claude: str, cfg: dict[str, Any], config_path: str, model: s
                     await session.interrupt()
             elif busy:
                 emit({"type": "error", "message": "still answering the previous message"})
+            elif msg.get("type") == "configure":
+                emit(await session.configure(msg))
             elif msg.get("type") == "reset":  # a new conversation is a new Claude Code process
                 await session.stop()
                 session.history.clear()

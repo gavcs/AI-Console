@@ -1,0 +1,4 @@
+# What python/agent.py needs: the MCP client (and httpx, which it also depends on).
+# python/claude_agent.py and the rest use only the standard library.
+mcp>=1.0
+httpx>=0.27

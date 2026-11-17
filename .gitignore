@@ -1,0 +1,19 @@
+# build output (make, cmake)
+/bin/
+/obj/
+/moc/
+/build/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# per-machine editor and assistant settings
+/.vscode/
+/.claude/
+.idea/
+
+# macOS
+.DS_Store

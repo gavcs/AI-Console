@@ -1,0 +1,24 @@
+{
+  "mcpServers": {
+    "hexstrike": {
+      "description": "HexStrike AI — offensive-security MCP, 150+ tools (github.com/0x4m4/hexstrike-ai). The REST server and the security tools run on one host; the bridge is launched there over ssh.",
+      "command": "ssh",
+      "args": [
+        "-o", "BatchMode=yes",
+        "user@remote-host",
+        "cd $HOME/hexstrike-ai && export PYTHONIOENCODING=utf-8 && exec ./hexstrike-env/bin/python hexstrike_mcp.py --server http://127.0.0.1:8888"
+      ],
+      "label": "Remote · HexStrike on another machine",
+      "service": {
+        "host": "user@remote-host",
+        "port": 8888,
+        "localPort": 18888,
+        "start": "cd $HOME/hexstrike-ai && ./hexstrike-env/bin/python hexstrike_server.py --port 8888",
+        "healthPath": "/health",
+        "infoPath": "/health",
+        "logFile": "~/hexstrike-ai/hexstrike.log",
+        "hint": "install: git clone https://github.com/0x4m4/hexstrike-ai; python3 -m venv hexstrike-env; ./hexstrike-env/bin/pip install -r requirements.txt. Run ./hexstrike-env/bin/python hexstrike_server.py --port 8888 by hand on the host to see startup errors. The scanning tools (nmap, gobuster, nuclei, ...) are separate installs."
+      }
+    }
+  }
+}

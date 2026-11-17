@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "files": {
+      "description": "Read-only access to files under your home folder (list, read, search)",
+      "command": "python3",
+      "args": ["${APP_PYTHON}/mcp_files.py", "--root", "${HOME}"]
+    }
+  }
+}

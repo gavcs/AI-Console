@@ -1,0 +1,22 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Qt
+        run: brew install qt
+      - name: Install Python requirements
+        run: python3 -m pip install -r requirements.txt
+      # Headless: the drivers run under Qt's offscreen platform, against a fake
+      # model server and a fake claude CLI (see tests/README.md).
+      - name: Build and test
+        run: make test

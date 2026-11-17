@@ -1,0 +1,37 @@
+{
+  "mcpServers": {
+    "ghidra": {
+      "description": "Ghidra reverse-engineering tools (GhidraMCP plugin + bridge, github.com/bethington/ghidra-mcp)",
+      "locations": [
+        {
+          "id": "local",
+          "label": "Local · Ghidra on this Mac",
+          "command": "python3",
+          "args": ["${APP_PYTHON}/ghidra_bridge.py", "--bridge-dir", "${HOME}/ghidra-mcp", "--url", "${SERVICE_URL}"],
+          "env": { "PYTHONIOENCODING": "utf-8" },
+          "service": {
+            "port": 8089,
+            "start": "ghidraRun",
+            "infoPath": "/mcp/instance_info",
+            "hint": "if the Ghidra window is open, check that the GhidraMCP extension is installed and enabled (project window: Tools > GhidraMCP > Server Status)"
+          }
+        },
+        {
+          "id": "remote",
+          "label": "Remote · Ghidra on another machine",
+          "command": "python3",
+          "args": ["${APP_PYTHON}/ghidra_bridge.py", "--bridge-dir", "${HOME}/ghidra-mcp", "--url", "${SERVICE_URL}", "--tcp-only"],
+          "env": { "PYTHONIOENCODING": "utf-8" },
+          "service": {
+            "host": "user@remote-host",
+            "port": 8089,
+            "localPort": 18089,
+            "start": "ghidraRun",
+            "infoPath": "/mcp/instance_info",
+            "hint": "if the Ghidra window is open, check that the GhidraMCP extension is installed and enabled (project window: Tools > GhidraMCP > Server Status)"
+          }
+        }
+      ]
+    }
+  }
+}

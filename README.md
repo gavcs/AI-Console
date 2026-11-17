@@ -1,5 +1,37 @@
 # AI Console
 
+## Prelude
+
+Claude models have been a pain to work with to get help with a lot of the cyber tooling
+I use due to the nature of it. I also wanted to be able to use a front end framework to
+get some experience with it. Due to Claude giving me access to fable without paying
+for usage credits for a week and a project deadline coming up that I wanted to be able to
+use this idea for, I opted to use Fable 5.2 to write this for me.
+
+This is not the end of the project as I hope to improve it and iron out all of the details
+to both add much more functionality and make it nicer to use. It looks slightly clunky as
+of now, but it works. The idea is that I can choose whichever model/provider I want
+based on what I have access to, including open source models. MacBook Pros have a lot
+of memory, which makes running LLMs on them somewhat feasible depending on the size. Further
+testing needs to be done to determine the usefulness of a locally running model when
+attempting to run more difficult tasks, but it's worked well for the tasks I've run so far.
+
+The big test will be to see if I can get it to help me build a ROP chain for my binary
+exploitation class. Regardless, this will help.
+
+*Where does this go from here?*
+
+I'm going to be fixing the appearance, making this work on Linux, and then greatly
+expanding the functionality of the MCP controls. The current dashboard is nowhere near
+where it should be, but it at least works in maintaining the health of the MCP servers
+as well as running and stopping them when they're no longer needed (including when the
+application is shut down). The dashboard will also serve as the way to manage the models
+running locally. It's important to note that this can manage remote MCP servers, and I
+would like to expand that to include models hosted by the user on other machines (such as
+a remote server over a tailnet, for example).
+
+## Details
+
 A macOS desktop console for running a model with [MCP](https://modelcontextprotocol.io) tools.
 Pick who answers (a local model behind any OpenAI-compatible server, or Claude
 Code), tick the MCP servers it may use, then chat or run a Python script.
